@@ -1,0 +1,8 @@
+{
+  "pc_ip": "192.168.1.101",
+  "trigger_port": 12345,
+  "video_port": 12346,
+  "wifi_ssid_hint": "",
+  "last_updated": "2026-10-15 19:28:08",
+  "auto_discover": true
+}

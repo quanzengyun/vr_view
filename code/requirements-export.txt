@@ -1,0 +1,2 @@
+# Export dependencies in addition to the existing acquisition environment.
+openpyxl==3.1.5
