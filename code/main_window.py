@@ -16,7 +16,6 @@ from data_worker import DataWorker, EemagineSDK
 from eeg_view_widget import EEGViewWidget
 from eeg_waveform_window import EEGWaveformWindow
 from erp_view_widget import ERPViewWidget
-from cnt_reader import read_cnt_file
 from erp_analyzer import ERPAnalyzer, EventMarker
 from impedance_widget import ImpedanceWidget
 from impedance_worker import ImpedanceWorker
@@ -24,6 +23,7 @@ from shared_buffer import DataPacket
 from marker_session import encode_marker
 from vr_marker_receiver import VRMarkerReceiver
 from vr_video_widget import VRVideoWidget
+from gaze_trajectory_widget import GazeTrajectoryWidget
 from biostyle import MAIN_QSS, EEGBreathingController
 
 
@@ -198,6 +198,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pushButton_toggle_vr.setCheckable(True)
         self.pushButton_toggle_vr.setChecked(False)
 
+        self.pushButton_toggle_gaze = self._button("隐藏注视轨迹", "secondary")
+        self.pushButton_toggle_gaze.setCheckable(True)
+        self.pushButton_toggle_gaze.setChecked(True)
+        self.pushButton_toggle_gaze.toggled.connect(self._on_toggle_gaze_dock)
+
         layout = QtWidgets.QVBoxLayout(group)
         layout.setSpacing(10)
         layout.addLayout(btn_layout)
@@ -205,6 +210,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.pushButton_import)
         layout.addWidget(self.pushButton_impedance)
         layout.addWidget(self.pushButton_toggle_vr)
+        layout.addWidget(self.pushButton_toggle_gaze)
 
         self.pushButton_start.toggled.connect(self._on_start_toggled)
         self.pushButton_pause.toggled.connect(self._on_pause_toggled)
@@ -274,7 +280,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.eegView = EEGViewWidget(self._data_worker.shared_buffer, parent=self.mainContainer,
                                      marker_session=self._data_worker.markers)
         self.eegView.markerLocated.connect(self._on_marker_located)
+        self.erp_analyzer.configure_preprocessing(self.eegView.channel_names)
+        self.erp_analyzer.configure_analysis_groups(self.eegView.channel_names)
         self.erpView = ERPViewWidget(self.erp_analyzer, parent=self.mainContainer)
+        self.erpView.set_channel_list(self.eegView.channel_names)
         self.erpView.setMinimumHeight(200)
 
         # DEBUG: 模拟数据由 _on_error 自动启用（放大器连不上时）
@@ -308,6 +317,21 @@ class MainWindow(QtWidgets.QMainWindow):
         # 把 VR 视频流 toggle 动作放到侧栏（不再使用 QMainWindow 顶部菜单，避免占据侧栏顶部一行）
         self.toggle_vr_action = self.vr_dock.toggleViewAction()
         self.toggle_vr_action.setText("VR 视频流")
+
+        self.gaze_trajectory_widget = GazeTrajectoryWidget(self)
+        self.gaze_dock = QtWidgets.QDockWidget("注视轨迹", self)
+        self.gaze_dock.setObjectName("gaze_trajectory_dock")
+        self.gaze_dock.setWidget(self.gaze_trajectory_widget)
+        self.gaze_dock.setFeatures(
+            QtWidgets.QDockWidget.DockWidgetMovable
+            | QtWidgets.QDockWidget.DockWidgetFloatable
+            | QtWidgets.QDockWidget.DockWidgetClosable
+        )
+        self.gaze_dock.setAllowedAreas(QtCore.Qt.AllDockWidgetAreas)
+        self.gaze_dock.visibilityChanged.connect(self._on_gaze_dock_visibility)
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.gaze_dock)
+        self.splitDockWidget(self.vr_dock, self.gaze_dock, QtCore.Qt.Vertical)
+        self.gaze_dock.show()
 
     def _init_sidebar_animation(self):
         self._sidebar_collapsed = False
@@ -452,10 +476,11 @@ class MainWindow(QtWidgets.QMainWindow):
             # 1b) 预热 _erp_buffer：用 shared_buffer 里已有的 packets 填满
             # 这样实验开始瞬间来的 marker 不会因 buffer 不够 pre-stimulus 被丢弃。
             pre_fill = []
-            with self._data_worker.shared_buffer.mutex:
-                for pkt in self._data_worker.shared_buffer.data_queue:
-                    pre_fill.append((pkt.timestamp, np.array(pkt.voltage, dtype=float)))
-            self._erp_buffer.extend(pre_fill)
+            if self.erp_analyzer.preprocessor is None:
+                with self._data_worker.shared_buffer.mutex:
+                    for pkt in self._data_worker.shared_buffer.data_queue:
+                        pre_fill.append((pkt.timestamp, np.array(pkt.voltage, dtype=float)))
+                self._erp_buffer.extend(pre_fill)
             # 保留最近的 epoch_length 个 sample（避免内存无限增长）
             epoch_len = self.erp_analyzer.epoch_length
             if len(self._erp_buffer) > epoch_len * 2:
@@ -514,15 +539,42 @@ class MainWindow(QtWidgets.QMainWindow):
         # 结束按钮已经取消选中，仍需处理最后一批 EEG 与刚定位的事件通知。
         self._process_erp(force=True)
         self.erp_analyzer.finish(self._erp_buffer)
-        log(f"[ERP] 已停止: target={self.erp_analyzer.n_target_trials}, "
+        log(f"[ERP] 采集停止，ERP当前: target={self.erp_analyzer.n_target_trials}, "
             f"standard={self.erp_analyzer.n_standard_trials}, "
             f"未纳入={dict(self.erp_analyzer.rejection_counts)}")
 
         def saved(path):
+            if getattr(self, '_closing', False):
+                return
+            # 原始数据先保存，后台ICA完成后再导出同一模型下的ERP结果。
+            self.erp_analyzer.poll_preprocessing()
+            if path and self.erp_analyzer.preprocessing_pending:
+                self.statusLabel.setText("状态: 原始数据已保存，等待眼电模型完成...")
+                QtCore.QTimer.singleShot(200, lambda: saved(path))
+                return
+            analysis_error = None
+            if path:
+                prefix = path[:-12] if path.endswith('.events.json') else os.path.splitext(path)[0]
+                try:
+                    self.erp_analyzer.export_results(prefix)
+                except Exception as exc:
+                    analysis_error = str(exc)
+                    log_exc("[ERP] 分析结果保存失败；原始数据已保存")
             self._stopping = False
             self.pushButton_start.setEnabled(True)
             self.combo_sampling.setEnabled(True)
-            self.statusLabel.setText("状态: 已停止" if path else "状态: 保存失败，请检查日志")
+            preprocessor = self.erp_analyzer.preprocessor
+            if not path:
+                self.statusLabel.setText("状态: 保存失败，请检查日志")
+            elif analysis_error:
+                self.statusLabel.setText("状态: 原始数据已保存，ERP结果导出失败")
+            elif preprocessor is not None and preprocessor.state != 'ready':
+                self.statusLabel.setText("状态: 原始数据已保存，ERP眼电模型不可用")
+            else:
+                self.statusLabel.setText("状态: 已停止，ERP结果已保存")
+            log(f"[ERP] 最终结果: target={self.erp_analyzer.n_target_trials}, "
+                f"standard={self.erp_analyzer.n_standard_trials}, "
+                f"未纳入={dict(self.erp_analyzer.rejection_counts)}")
             if path:
                 QtWidgets.QMessageBox.information(self, "保存完成", f"记录已保存至:\n{path}")
         self.eegView.stop_and_save_record_async(self.save_dir, on_done=saved)
@@ -683,6 +735,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.erp_analyzer.pre_stimulus_samples + self.erp_analyzer.post_stimulus_samples
             )
             self.erp_analyzer.reset()
+            self.erp_analyzer.configure_preprocessing(channel_names)
+            self.erp_analyzer.configure_analysis_groups(channel_names)
+            self.erpView.set_channel_list(channel_names)
             print(f"[ERPAnalyzer] 已重置为 {len(channel_names)} 通道")
         except Exception as e:
             print(f"[ERPAnalyzer] 重置失败: {e}")
@@ -735,13 +790,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if not force and not self.pushButton_start.isChecked():
             return
         packets = self._data_worker.markers.packets_since(self._erp_next_index)
-        for packet in packets:
-            self._erp_next_index = packet.sample_index + 1
-            arr = np.array(packet.voltage, dtype=float)
-            self._erp_buffer.append((packet.timestamp, arr))
+        if packets:
+            self._erp_next_index = packets[-1].sample_index + 1
+        preprocessor = self.erp_analyzer.preprocessor
+        frames = (preprocessor.process_batch(packets) if preprocessor is not None else
+                  [(p.timestamp, np.array(p.voltage, dtype=float)) for p in packets])
+        for timestamp, arr in frames:
+            self._erp_buffer.append((timestamp, arr))
             if len(self._erp_buffer) > self._erp_max_size:
                 self._erp_buffer.pop(0)
-            self.erp_analyzer.process_data_packet(packet.timestamp, arr, self._erp_buffer)
+            self.erp_analyzer.process_data_packet(timestamp, arr, self._erp_buffer)
         # 通知可能晚于最后一批数据；无新样本时也要重试已经齐全的事件。
         if not packets and self._erp_buffer:
             ts, arr = self._erp_buffer[-1]
@@ -752,6 +810,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.vr_dock.isVisible() != checked:
             self.vr_dock.setVisible(checked)
         self.pushButton_toggle_vr.setText("隐藏 VR 视频" if checked else "显示 VR 视频")
+
+    def _on_toggle_gaze_dock(self, checked: bool):
+        self.gaze_dock.setVisible(checked)
+
+    def _on_gaze_dock_visibility(self, visible: bool):
+        button = self.pushButton_toggle_gaze
+        blocker = QtCore.QSignalBlocker(button)
+        button.setChecked(visible)
+        button.setText("隐藏注视轨迹" if visible else "显示注视轨迹")
+        del blocker
 
     def _on_vr_dock_visibility(self, visible: bool):
         """dock 隐藏时（用户直接关闭）也要同步按钮状态"""
@@ -782,6 +850,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "导入失败", f"读取文件失败: {e}")
 
     def _import_cnt(self, path: str):
+        from cnt_reader import read_cnt_file
         data, sample_rate, channel_names, start_time_ms = read_cnt_file(path)
 
         sr_str = str(int(sample_rate))
@@ -940,6 +1009,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._swallow_video_err("frame")
 
     def _on_vr_gaze(self, x: float, y: float):
+        self.gaze_trajectory_widget.update_gaze_point(x, y)
         try:
             self.vr_video_widget.update_gaze_point(x, y)
         except Exception:
@@ -973,6 +1043,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not hasattr(self, 'vr_marker_receiver'):
             return
         recv = getattr(self.vr_marker_receiver, 'is_connected', False)
+        if not recv:
+            self.gaze_trajectory_widget.break_trace()
         if recv:
             color = "#4caf50"        # 绿
             text = "已连接"
@@ -1021,6 +1093,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         section("程序关闭")
+        self._closing = True
+        if self.erp_analyzer.preprocessor is not None:
+            self.erp_analyzer.preprocessor.reset()
         self._stop_impedance_worker()
         self._data_worker.request_stop()
         if self._data_thread.isRunning():

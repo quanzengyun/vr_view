@@ -28,6 +28,7 @@ class ERPViewWidget(QtWidgets.QWidget):
         # 显示配置
         self.show_p300 = True  # 是否显示 P300 差异波
         self.selected_channel_idx: Optional[int] = None  # None 表示显示所有通道平均
+        self.selected_group_idx: Optional[int] = None
         
         self._init_ui()
         
@@ -88,6 +89,9 @@ class ERPViewWidget(QtWidgets.QWidget):
         title_layout.addStretch(1)
         
         layout.addWidget(title_bar)
+        self.preprocessing_label = QtWidgets.QLabel(self)
+        self.preprocessing_label.setWordWrap(True)
+        layout.addWidget(self.preprocessing_label)
         
         # 绘图区域
         self.plot = pg.PlotWidget(background="#F0F4F8")
@@ -129,13 +133,34 @@ class ERPViewWidget(QtWidgets.QWidget):
     
     def set_channel_list(self, channel_names: List[str]) -> None:
         """设置通道列表"""
+        if self.erp_analyzer.analysis_groups:
+            self.combo_channel.blockSignals(True)
+            self.combo_channel.clear()
+            for group in self.erp_analyzer.analysis_groups:
+                self.combo_channel.addItem(group['label'])
+            self.combo_channel.setCurrentIndex(2)  # 默认Pz，四个选项按约定顺序排列。
+            self.combo_channel.blockSignals(False)
+            self._on_channel_changed(2)
+            return
         self.combo_channel.clear()
         self.combo_channel.addItem("所有通道平均")
         for i, name in enumerate(channel_names):
             self.combo_channel.addItem(f"{i+1}. {name}")
+        if self.erp_analyzer.preprocessor is not None:
+            preferred = next((name for name in ('Pz','Cz') if name in channel_names), channel_names[0])
+            self.combo_channel.setCurrentIndex(channel_names.index(preferred)+1)
     
     def _on_channel_changed(self, index: int) -> None:
         """通道选择改变"""
+        if self.erp_analyzer.analysis_groups:
+            if index < 0:
+                return
+            self.selected_group_idx = index
+            group = self.erp_analyzer.analysis_groups[index]
+            self.selected_channel_idx = group['indices'][0] if len(group['indices']) == 1 else None
+            self._update_plot()
+            return
+        self.selected_group_idx = None
         if index == 0:
             self.selected_channel_idx = None  # 所有通道平均
         else:
@@ -151,7 +176,16 @@ class ERPViewWidget(QtWidgets.QWidget):
     def _update_plot(self) -> None:
         """更新绘图"""
         # 获取 ERP 数据
-        erp_data = self.erp_analyzer.get_erp_data(channel_idx=self.selected_channel_idx)
+        erp_data = self.erp_analyzer.get_erp_data(channel_idx=self.selected_channel_idx, group_idx=self.selected_group_idx)
+        reasons = {'amplitude_artifact':'振幅超限', 'variance_artifact':'方差超限',
+                   'incomplete_post_stimulus_at_stop':'停止时后窗不足',
+                   'eye_model_unavailable':'眼电模型不可用'}
+        counts = self.erp_analyzer.rejection_counts
+        details = '；'.join(f'{label}: {counts[reason]}' for reason,label in reasons.items() if counts[reason])
+        self.preprocessing_label.setText(erp_data['preprocessing_status'] + ('；'+details if details else ''))
+        if erp_data['unit'] == 'V':
+            erp_data = dict(erp_data, **{key: erp_data[key]*1e6
+                                       for key in ('target','standard','p300') if key in erp_data})
         
         # 更新试次统计
         self.trial_label.setText(

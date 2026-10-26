@@ -84,6 +84,53 @@ class ERPAnalyzer:
         self.n_standard_trials = 0
         self.rejected_events = []
         self.rejection_counts = Counter()
+        self.preprocessor = None
+        self._deferred_epochs = []
+        self.trial_quality = []
+        self.analysis_groups = []
+        self.analysis_channel_names = []
+        self._analysis_indices = None
+        self.analysis_error = None
+
+    def configure_analysis_groups(self, channel_names):
+        """ICA/参考仍使用全部通道；四个ERP选项共享五个关键通道的质控试次集。"""
+        definitions = [('Fz + FC1 + FC2 平均', ['Fz','FC1','FC2']),
+                       ('Cz', ['Cz']), ('Pz', ['Pz']), ('Fz', ['Fz'])]
+        lookup = {name.casefold(): i for i,name in enumerate(channel_names)}
+        required = ['Fz','FC1','FC2','Cz','Pz']
+        missing = [name for name in required if name.casefold() not in lookup]
+        self.analysis_error = '缺少ERP分析通道：' + ', '.join(missing) if missing else None
+        self.analysis_channel_names = required
+        self._analysis_indices = None if missing else np.array([lookup[n.casefold()] for n in required])
+        self.analysis_groups = [dict(label=label, channels=names,
+            indices=[lookup[n.casefold()] for n in names if n.casefold() in lookup],
+            available=all(n.casefold() in lookup for n in names)) for label,names in definitions]
+
+    def configure_preprocessing(self, channel_names, config=None, fit_function=None):
+        from erp_preprocessing import OnlineERPPreprocessor
+        if self.preprocessor is not None:
+            self.preprocessor.reset()  # 使上一记录的后台拟合结果失效。
+        self.preprocessor = OnlineERPPreprocessor(channel_names, self.sample_rate, config, fit_function)
+
+    def poll_preprocessing(self):
+        if self.preprocessor is None or not self._deferred_epochs:
+            return
+        state = self.preprocessor.state
+        if state not in {"ready", "error", "insufficient"}:
+            return
+        pending, self._deferred_epochs = self._deferred_epochs, []
+        for event, epoch in pending:
+            if state != "ready":
+                self._record_rejection(event, "eye_model_unavailable")
+                continue
+            cleaned = self.preprocessor.clean_epoch_uv(epoch)
+            outcome = self._store_epoch(event, cleaned)
+            if outcome != "accepted":
+                self._record_rejection(event, outcome)
+
+    @property
+    def preprocessing_pending(self):
+        return self.preprocessor is not None and self.preprocessor.state in {"collecting", "fitting"}
     
     def add_event(self, event: EventMarker) -> None:
         """添加事件标记"""
@@ -124,6 +171,7 @@ class ERPAnalyzer:
                 self._record_rejection(event, outcome)
         with self.event_lock:
             self.event_queue.extendleft(reversed(waiting))
+        self.poll_preprocessing()
 
     def _record_rejection(self, event, reason):
         self.rejected_events.append(dict(timestamp_ms=event.timestamp_ms,
@@ -132,6 +180,8 @@ class ERPAnalyzer:
 
     def finish(self, data_buffer):
         """停止时先完成可用试次，再明确记录无法等到完整后窗的事件。"""
+        if self.preprocessor is not None:
+            self.preprocessor.finish_collection()
         if data_buffer:
             self.process_data_packet(data_buffer[-1][0], data_buffer[-1][1], data_buffer)
         with self.event_lock:
@@ -139,6 +189,7 @@ class ERPAnalyzer:
             self.event_queue.clear()
         for event in remaining:
             self._record_rejection(event, "incomplete_post_stimulus_at_stop")
+        self.poll_preprocessing()
     
     def _extract_epoch(
         self,
@@ -179,11 +230,37 @@ class ERPAnalyzer:
         epoch_data = np.stack([voltage for _, voltage in segment], axis=1).astype(float)
         if not np.all(np.isfinite(epoch_data)):
             return "nonfinite_samples"
+        if self.preprocessor is not None:
+            # 已完整提取的试次单独暂存，拟合期间不再依赖会滚动淘汰的缓冲区。
+            self._deferred_epochs.append((event, epoch_data))
+            return "accepted"
+        return self._store_epoch(event, epoch_data)
+
+    def _store_epoch(self, event, epoch_data):
         
         # 基线校正（使用 pre-stimulus 期间的平均值）
         if self.baseline_correction:
             baseline = np.mean(epoch_data[:, :self.pre_stimulus_samples], axis=1, keepdims=True)
             epoch_data = epoch_data - baseline
+        if self.preprocessor is not None:
+            # MATLAB的振幅与方差规则；此处数据已经是微伏，var使用N-1分母。
+            if self.analysis_error:
+                return 'analysis_channels_unavailable'
+            indices = self._analysis_indices if self._analysis_indices is not None else np.arange(self.n_channels)
+            quality_data = epoch_data[indices]
+            peak_channel = int(indices[np.argmax(np.max(np.abs(quality_data), axis=1))])
+            amplitude = float(np.max(np.abs(quality_data)))
+            variance = float(np.var(quality_data, ddof=1))
+            quality = dict(timestamp_ms=event.timestamp_ms, event_type=event.event_type,
+                           max_amplitude_uv=amplitude, variance_uv2=variance,
+                           peak_channel=self.preprocessor.channel_names[peak_channel], status='accepted')
+            self.trial_quality.append(quality)
+            if amplitude > self.preprocessor.config.amplitude_uv:
+                quality['status'] = 'amplitude_artifact'
+                return "amplitude_artifact"
+            if variance > self.preprocessor.config.variance_uv2:
+                quality['status'] = 'variance_artifact'
+                return "variance_artifact"
         
         # 添加到对应的列表
         if event.event_type.lower() == 'target':
@@ -215,7 +292,7 @@ class ERPAnalyzer:
         if self.target_erp is not None and self.standard_erp is not None:
             self.p300_erp = self.target_erp - self.standard_erp
     
-    def get_erp_data(self, channel_idx: Optional[int] = None) -> Dict[str, np.ndarray]:
+    def get_erp_data(self, channel_idx: Optional[int] = None, group_idx: Optional[int] = None) -> Dict[str, np.ndarray]:
         """
         获取指定通道的 ERP 数据
         
@@ -232,14 +309,27 @@ class ERPAnalyzer:
                 'n_standard': standard 试次数
             }
         """
+        self.poll_preprocessing()
         result = {
             'time': self.time_axis_ms,
             'n_target': self.n_target_trials,
             'n_standard': self.n_standard_trials,
             'n_rejected': len(self.rejected_events),
+            'unit': 'uV' if self.preprocessor is not None else 'V',
+            'preprocessing_status': '' if self.preprocessor is None else self.preprocessor.status_text(),
         }
         with self.event_lock:
-            result['n_pending'] = len(self.event_queue)
+            result['n_pending'] = len(self.event_queue) + len(self._deferred_epochs)
+        if self.analysis_error:
+            result['preprocessing_status'] += '；' + self.analysis_error
+        if group_idx is not None:
+            group = self.analysis_groups[group_idx]
+            result['analysis_group'] = group['label']
+            if group['available']:
+                for key, data in [('target',self.target_erp),('standard',self.standard_erp),('p300',self.p300_erp)]:
+                    if data is not None:
+                        result[key] = data[group['indices']].mean(axis=0)
+            return result
         
         if channel_idx is not None:
             # 单个通道
@@ -273,6 +363,64 @@ class ERPAnalyzer:
         self.n_standard_trials = 0
         self.rejected_events.clear()
         self.rejection_counts.clear()
+        self._deferred_epochs.clear()
+        self.trial_quality.clear()
+        if self.preprocessor is not None:
+            self.preprocessor.reset()
+
+    def export_results(self, prefix):
+        """保存已完成的在线结果和眼电模型，原始EDF/CSV不修改。"""
+        import json
+        self.poll_preprocessing()
+        if self.preprocessing_pending:
+            raise RuntimeError("眼电模型尚未就绪")
+        shape = (0, self.n_channels, self.epoch_length)
+        arrays = dict(time_ms=self.time_axis_ms,
+                      target_epochs_uv=np.stack(self.target_epochs) if self.target_epochs else np.empty(shape),
+                      standard_epochs_uv=np.stack(self.standard_epochs) if self.standard_epochs else np.empty(shape),
+                      target_uv=self.target_erp if self.target_erp is not None else np.empty((0,)),
+                      standard_uv=self.standard_erp if self.standard_erp is not None else np.empty((0,)),
+                      difference_uv=self.p300_erp if self.p300_erp is not None else np.empty((0,)))
+        if self.preprocessor is None:
+            for name in ('target_epochs_uv','standard_epochs_uv','target_uv','standard_uv','difference_uv'):
+                arrays[name] = arrays[name] * 1e6
+        if self.preprocessor is not None:
+            arrays.update(fir_taps=self.preprocessor.taps,
+                          channel_names=np.asarray(self.preprocessor.channel_names))
+        if self.analysis_groups and not self.analysis_error:
+            indices = self._analysis_indices
+            # ERP导出仅包含关键通道。ICA输入通道单独命名，不与分析维度混淆。
+            if self.preprocessor is not None:
+                arrays['ica_channel_names'] = np.asarray(self.preprocessor.channel_names)
+            arrays['channel_names'] = np.asarray(self.analysis_channel_names)
+            for key in ('target_epochs_uv','standard_epochs_uv'):
+                arrays[key] = arrays[key][:,indices,:]
+            for key in ('target_uv','standard_uv','difference_uv'):
+                full = arrays[key]
+                arrays['group_'+key] = (np.stack([full[g['indices']].mean(axis=0) for g in self.analysis_groups])
+                                        if full.ndim == 2 else np.empty((0,self.epoch_length)))
+                if full.ndim == 2:
+                    arrays[key] = full[indices]
+            arrays['analysis_group_labels'] = np.asarray([g['label'] for g in self.analysis_groups])
+        if self.preprocessor is not None and self.preprocessor.model is not None:
+            model = self.preprocessor.model
+            arrays.update(ica_projection=model['projection'], ica_offset_v=model['offset'],
+                          iclabel_probabilities=model['probabilities'],
+                          excluded_components_zero_based=np.asarray(model['excluded'], dtype=int))
+        np.savez_compressed(prefix + '.erp.npz', **arrays)
+        metadata = dict(sample_rate=self.sample_rate, output_unit='uV', window_ms=[-self.pre_stimulus_ms, self.post_stimulus_ms],
+                        window_endpoint='exclusive', baseline_ms=[-self.pre_stimulus_ms,0],
+                        target_trials=self.n_target_trials, standard_trials=self.n_standard_trials,
+                        rejected_events=self.rejected_events, rejection_counts=dict(self.rejection_counts),
+                        trial_quality=self.trial_quality,
+                        analysis_channels=self.analysis_channel_names,
+                        analysis_groups=[dict(label=g['label'],channels=g['channels']) for g in self.analysis_groups],
+                        quality_policy='shared_trial_mask_over_analysis_channels' if self.analysis_groups else 'all_channels',
+                        analysis_error=self.analysis_error,
+                        pending_events=len(self.event_queue)+len(self._deferred_epochs),
+                        preprocessing=None if self.preprocessor is None else self.preprocessor.metadata())
+        with open(prefix + '.erp.json', 'w', encoding='utf-8') as output:
+            json.dump(metadata, output, ensure_ascii=False, indent=2)
 
     # ------------------------------------------------------------------
     # 基于硬件 trigger 通道的 epoch 提取（更精确）
@@ -301,6 +449,8 @@ class ERPAnalyzer:
         """
         if not packets:
             return 0, 0
+        if self.preprocessor is not None:
+            raise RuntimeError("启用预处理时必须通过软件事件队列分段，不能绕过眼电模型")
 
         added_target = 0
         added_standard = 0
