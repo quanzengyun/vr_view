@@ -83,22 +83,20 @@ class ERPAnalyzer:
         self.trial_quality = []
         self.analysis_groups = []
         self.analysis_channel_names = []
-        self._analysis_indices = None
+        self._quality_indices = None
+        self.quality_channel_names = []
         self.analysis_error = None
 
     def configure_analysis_groups(self, channel_names):
-        """坏导插值和重参考仍使用全部通道；四个ERP选项共享五个关键通道的质控试次集。"""
-        definitions = [('Fz + FC1 + FC2 平均', ['Fz','FC1','FC2']),
-                       ('Cz', ['Cz']), ('Pz', ['Pz']), ('Fz', ['Fz'])]
-        lookup = {name.casefold(): i for i,name in enumerate(channel_names)}
-        required = ['Fz','FC1','FC2','Cz','Pz']
-        missing = [name for name in required if name.casefold() not in lookup]
-        self.analysis_error = '缺少ERP分析通道：' + ', '.join(missing) if missing else None
-        self.analysis_channel_names = required
-        self._analysis_indices = None if missing else np.array([lookup[n.casefold()] for n in required])
-        self.analysis_groups = [dict(label=label, channels=names,
-            indices=[lookup[n.casefold()] for n in names if n.casefold() in lookup],
-            available=all(n.casefold() in lookup for n in names)) for label,names in definitions]
+        """M1/M2不参与ERP；其余通道独立显示并共享全覆盖试次质量检查。"""
+        included = [(i, name) for i, name in enumerate(channel_names)
+                    if name.casefold() not in {'m1', 'm2'}]
+        self.analysis_channel_names = [name for _, name in included]
+        self.quality_channel_names = list(self.analysis_channel_names)
+        self._quality_indices = np.array([i for i, _ in included], dtype=int)
+        self.analysis_error = None if included else '没有可用于ERP分析的通道'
+        self.analysis_groups = [dict(label=name, channels=[name], indices=[i], available=True)
+                                for i, name in included]
 
     def configure_preprocessing(self, channel_names, config=None, model_function=None):
         from erp_preprocessing import OnlineERPPreprocessor
@@ -224,7 +222,7 @@ class ERPAnalyzer:
             return 'analysis_channels_unavailable'
         if self.preprocessor is not None and not self.preprocessor.config.empty_acquisition_debug:
             # MATLAB的振幅与方差规则；此处数据已经是微伏，var使用N-1分母。
-            indices = self._analysis_indices if self._analysis_indices is not None else np.arange(self.n_channels)
+            indices = self._quality_indices if self._quality_indices is not None else np.arange(self.n_channels)
             quality_data = epoch_data[indices]
             peak_channel = int(indices[np.argmax(np.max(np.abs(quality_data), axis=1))])
             amplitude = float(np.max(np.abs(quality_data)))
@@ -361,19 +359,18 @@ class ERPAnalyzer:
             arrays.update(fir_taps=self.preprocessor.taps,
                           channel_names=np.asarray(self.preprocessor.channel_names))
         if self.analysis_groups and not self.analysis_error:
-            indices = self._analysis_indices
-            # ERP导出仅包含关键通道。预处理输入通道单独命名，不与分析维度混淆。
+            # ERP结果排除M1/M2；预处理通道和插值矩阵仍对应完整采集输入。
             if self.preprocessor is not None:
                 arrays['preprocessing_channel_names'] = np.asarray(self.preprocessor.channel_names)
             arrays['channel_names'] = np.asarray(self.analysis_channel_names)
-            for key in ('target_epochs_uv','standard_epochs_uv'):
-                arrays[key] = arrays[key][:,indices,:]
+            for key in ('target_epochs_uv', 'standard_epochs_uv'):
+                arrays[key] = arrays[key][:, self._quality_indices, :]
             for key in ('target_uv','standard_uv','difference_uv'):
                 full = arrays[key]
                 arrays['group_'+key] = (np.stack([full[g['indices']].mean(axis=0) for g in self.analysis_groups])
                                         if full.ndim == 2 else np.empty((0,self.epoch_length)))
                 if full.ndim == 2:
-                    arrays[key] = full[indices]
+                    arrays[key] = full[self._quality_indices]
             arrays['analysis_group_labels'] = np.asarray([g['label'] for g in self.analysis_groups])
         if self.preprocessor is not None and self.preprocessor.model is not None:
             model = self.preprocessor.model
@@ -385,12 +382,13 @@ class ERPAnalyzer:
                         rejected_events=self.rejected_events, rejection_counts=dict(self.rejection_counts),
                         trial_quality=self.trial_quality,
                         analysis_channels=self.analysis_channel_names,
+                        quality_channels=self.quality_channel_names,
                         analysis_groups=[dict(label=g['label'],channels=g['channels']) for g in self.analysis_groups],
                         experiment_mode='empty_acquisition_debug' if self.preprocessor is not None
                             and self.preprocessor.config.empty_acquisition_debug else 'experiment',
                         quality_policy=('disabled_for_empty_acquisition_debug' if self.preprocessor is not None
                             and self.preprocessor.config.empty_acquisition_debug else
-                            'shared_trial_mask_over_analysis_channels' if self.analysis_groups else 'all_channels'),
+                            'shared_trial_mask_over_quality_channels' if self.analysis_groups else 'all_channels'),
                         analysis_error=self.analysis_error,
                         pending_events=len(self.event_queue),
                         preprocessing=None if self.preprocessor is None else self.preprocessor.metadata())
