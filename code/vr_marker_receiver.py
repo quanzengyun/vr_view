@@ -10,7 +10,7 @@ from typing import Optional, Callable
 from queue import Queue
 from erp_analyzer import EventMarker
 from vr_video_receiver import VRVideoReceiver
-from diag import log, log_exc
+from diag import log, log_exc, debug
 
 
 class VRMarkerReceiver:
@@ -78,11 +78,10 @@ class VRMarkerReceiver:
             self.receiver_thread.start()
 
             # 启动独立视频流接收（端口 12346，与 trigger 12345 完全分离）
-            try:
-                self.video_receiver.start()
+            if self.video_receiver.start():
                 log("[VRMarker] 视频流接收器已启动 @ 0.0.0.0:12346")
-            except Exception:
-                log_exc("[VRMarker] 视频流接收器启动失败（trigger 不受影响）:")
+            else:
+                log("[VRMarker] 视频流接收器启动失败（trigger 不受影响）")
 
             print(f"[VR Marker Receiver] 服务器启动成功，监听 {self.host}:{self.port}")
             return True
@@ -194,9 +193,9 @@ class VRMarkerReceiver:
 
                     # 记录收到的数据（用于调试，前100字节）
                     if len(data) <= 100:
-                        log(f"[VRMarker] 收到数据 ({len(data)}B): {data!r}")
+                        debug(f"[VRMarker] 收到数据 ({len(data)}B): {data!r}")
                     else:
-                        log(f"[VRMarker] 收到数据 ({len(data)}B): {data[:100]!r}...")
+                        debug(f"[VRMarker] 收到数据 ({len(data)}B): {data[:100]!r}...")
 
                     # 处理接收到的数据
                     self._process_received_data(data)

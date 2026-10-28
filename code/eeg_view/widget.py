@@ -8,10 +8,10 @@ import pyqtgraph as pg
 from shared_buffer import SharedBuffer, DataPacket
 
 try:
-    from diag import log as _dlog
-except Exception:  # diag 未安装时退回 print，保证模块仍可独立导入
+    from diag import debug as _dlog
+except Exception:  # diag 不可用时静默调试信息，保证模块仍可独立导入
     def _dlog(msg):
-        print(msg, flush=True)
+        pass
 
 from .channel_meta import (
     STANDARD_32_CHANNELS, REGION_ORDER, ChannelItemDelegate,
@@ -146,8 +146,10 @@ class EEGViewWidget(QtWidgets.QWidget):
         self._install_grid()
         self._install_axis()
 
-        # 两个 PlotWidget 分别布局；相同 XRange 并不保证同一时刻落在同一像素。
-        # 标记栏预留与主图相同的 Y 轴宽度，随通道文字/字体变化自动同步。
+        # 通道名由左侧列表显示，主图不重复显示 Y 轴标签。
+        self.plot.getAxis("left").setTicks([])
+        self.plot.getAxis("left").setWidth(0)
+        # 主图和标记栏保持相同的左右轴宽度。
         for side in ("left", "right"):
             self.plot.getAxis(side).geometryChanged.connect(self._sync_marker_axis_widths)
         self._sync_marker_axis_widths()
@@ -190,13 +192,6 @@ class EEGViewWidget(QtWidgets.QWidget):
             curve.setProperty("normOffset", offset)
             self.curves.append(curve)
             self.label_list.addItem(QtWidgets.QListWidgetItem(name))
-
-        # Y 轴刻度（通道名）
-        axis_left = self.plot.getAxis("left")
-        axis_left.setTicks([[
-            (float(self.curves[i].property("normOffset")), self.channel_names[i])
-            for i in range(self.channel_count)
-        ]])
 
     # ---------------- 公开 API ----------------
 

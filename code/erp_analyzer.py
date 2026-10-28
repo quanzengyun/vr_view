@@ -11,13 +11,6 @@ from bisect import bisect_left
 from dataclasses import dataclass
 import threading
 
-# DataPacket 类型仅作类型提示参考；本模块通过 duck typing 访问 .trigger/.voltage 字段
-try:
-    from shared_buffer import DataPacket  # noqa: F401
-except ImportError:
-    DataPacket = None
-
-
 @dataclass
 class EventMarker:
     """事件标记：target 或 standard 刺激"""
@@ -41,8 +34,8 @@ class ERPAnalyzer:
         self,
         sample_rate: float = 1000.0,
         n_channels: int = 32,
-        pre_stimulus_ms: int = 200,   # 刺激前时间 (ms)，与 offline_erp.py 保持一致
-        post_stimulus_ms: int = 800,  # 刺激后时间 (ms)，与 offline_erp.py 保持一致
+        pre_stimulus_ms: int = 100,
+        post_stimulus_ms: int = 500,
         baseline_correction: bool = True,  # 基线校正
     ):
         self.sample_rate = sample_rate
@@ -78,6 +71,8 @@ class ERPAnalyzer:
         self.target_erp: Optional[np.ndarray] = None  # shape: (n_channels, epoch_length)
         self.standard_erp: Optional[np.ndarray] = None
         self.p300_erp: Optional[np.ndarray] = None  # target - standard
+        self._target_sum = None
+        self._standard_sum = None
         
         # 统计信息
         self.n_target_trials = 0
@@ -85,7 +80,6 @@ class ERPAnalyzer:
         self.rejected_events = []
         self.rejection_counts = Counter()
         self.preprocessor = None
-        self._deferred_epochs = []
         self.trial_quality = []
         self.analysis_groups = []
         self.analysis_channel_names = []
@@ -93,7 +87,7 @@ class ERPAnalyzer:
         self.analysis_error = None
 
     def configure_analysis_groups(self, channel_names):
-        """ICA/参考仍使用全部通道；四个ERP选项共享五个关键通道的质控试次集。"""
+        """坏导插值和重参考仍使用全部通道；四个ERP选项共享五个关键通道的质控试次集。"""
         definitions = [('Fz + FC1 + FC2 平均', ['Fz','FC1','FC2']),
                        ('Cz', ['Cz']), ('Pz', ['Pz']), ('Fz', ['Fz'])]
         lookup = {name.casefold(): i for i,name in enumerate(channel_names)}
@@ -106,31 +100,15 @@ class ERPAnalyzer:
             indices=[lookup[n.casefold()] for n in names if n.casefold() in lookup],
             available=all(n.casefold() in lookup for n in names)) for label,names in definitions]
 
-    def configure_preprocessing(self, channel_names, config=None, fit_function=None):
+    def configure_preprocessing(self, channel_names, config=None, model_function=None):
         from erp_preprocessing import OnlineERPPreprocessor
         if self.preprocessor is not None:
-            self.preprocessor.reset()  # 使上一记录的后台拟合结果失效。
-        self.preprocessor = OnlineERPPreprocessor(channel_names, self.sample_rate, config, fit_function)
-
-    def poll_preprocessing(self):
-        if self.preprocessor is None or not self._deferred_epochs:
-            return
-        state = self.preprocessor.state
-        if state not in {"ready", "error", "insufficient"}:
-            return
-        pending, self._deferred_epochs = self._deferred_epochs, []
-        for event, epoch in pending:
-            if state != "ready":
-                self._record_rejection(event, "eye_model_unavailable")
-                continue
-            cleaned = self.preprocessor.clean_epoch_uv(epoch)
-            outcome = self._store_epoch(event, cleaned)
-            if outcome != "accepted":
-                self._record_rejection(event, outcome)
+            self.preprocessor.reset()  # 使上一记录的后台初始化结果失效。
+        self.preprocessor = OnlineERPPreprocessor(channel_names, self.sample_rate, config, model_function)
 
     @property
     def preprocessing_pending(self):
-        return self.preprocessor is not None and self.preprocessor.state in {"collecting", "fitting"}
+        return self.preprocessor is not None and self.preprocessor.state in {"collecting", "processing"}
     
     def add_event(self, event: EventMarker) -> None:
         """添加事件标记"""
@@ -171,7 +149,6 @@ class ERPAnalyzer:
                 self._record_rejection(event, outcome)
         with self.event_lock:
             self.event_queue.extendleft(reversed(waiting))
-        self.poll_preprocessing()
 
     def _record_rejection(self, event, reason):
         self.rejected_events.append(dict(timestamp_ms=event.timestamp_ms,
@@ -182,14 +159,17 @@ class ERPAnalyzer:
         """停止时先完成可用试次，再明确记录无法等到完整后窗的事件。"""
         if self.preprocessor is not None:
             self.preprocessor.finish_collection()
+            if self.preprocessor.continuous_output and self.preprocessing_pending:
+                return  # MainWindow drains the cleaned continuous backlog after initialization.
         if data_buffer:
             self.process_data_packet(data_buffer[-1][0], data_buffer[-1][1], data_buffer)
         with self.event_lock:
             remaining = list(self.event_queue)
             self.event_queue.clear()
         for event in remaining:
-            self._record_rejection(event, "incomplete_post_stimulus_at_stop")
-        self.poll_preprocessing()
+            reason = ('preprocessing_unavailable' if self.preprocessor is not None
+                      and self.preprocessor.state != 'ready' else 'incomplete_post_stimulus_at_stop')
+            self._record_rejection(event, reason)
     
     def _extract_epoch(
         self,
@@ -231,9 +211,7 @@ class ERPAnalyzer:
         if not np.all(np.isfinite(epoch_data)):
             return "nonfinite_samples"
         if self.preprocessor is not None:
-            # 已完整提取的试次单独暂存，拟合期间不再依赖会滚动淘汰的缓冲区。
-            self._deferred_epochs.append((event, epoch_data))
-            return "accepted"
+            epoch_data *= 1e6  # Continuous preprocessing already performed in volts.
         return self._store_epoch(event, epoch_data)
 
     def _store_epoch(self, event, epoch_data):
@@ -242,10 +220,10 @@ class ERPAnalyzer:
         if self.baseline_correction:
             baseline = np.mean(epoch_data[:, :self.pre_stimulus_samples], axis=1, keepdims=True)
             epoch_data = epoch_data - baseline
-        if self.preprocessor is not None:
+        if self.preprocessor is not None and self.analysis_error:
+            return 'analysis_channels_unavailable'
+        if self.preprocessor is not None and not self.preprocessor.config.empty_acquisition_debug:
             # MATLAB的振幅与方差规则；此处数据已经是微伏，var使用N-1分母。
-            if self.analysis_error:
-                return 'analysis_channels_unavailable'
             indices = self._analysis_indices if self._analysis_indices is not None else np.arange(self.n_channels)
             quality_data = epoch_data[indices]
             peak_channel = int(indices[np.argmax(np.max(np.abs(quality_data), axis=1))])
@@ -266,31 +244,25 @@ class ERPAnalyzer:
         if event.event_type.lower() == 'target':
             self.target_epochs.append(epoch_data)
             self.n_target_trials += 1
+            if self._target_sum is None:
+                self._target_sum = epoch_data.copy()
+            else:
+                self._target_sum += epoch_data
+            self.target_erp = self._target_sum / self.n_target_trials
         elif event.event_type.lower() == 'standard':
             self.standard_epochs.append(epoch_data)
             self.n_standard_trials += 1
+            if self._standard_sum is None:
+                self._standard_sum = epoch_data.copy()
+            else:
+                self._standard_sum += epoch_data
+            self.standard_erp = self._standard_sum / self.n_standard_trials
         else:
             return "unsupported_event_type"
 
-        # 更新平均 ERP
-        self._update_average_erp()
-        return "accepted"
-    
-    def _update_average_erp(self) -> None:
-        """更新平均 ERP"""
-        if self.target_epochs:
-            # 计算 target 平均 ERP
-            target_array = np.stack(self.target_epochs, axis=0)  # (n_trials, n_channels, epoch_length)
-            self.target_erp = np.mean(target_array, axis=0)  # (n_channels, epoch_length)
-        
-        if self.standard_epochs:
-            # 计算 standard 平均 ERP
-            standard_array = np.stack(self.standard_epochs, axis=0)  # (n_trials, n_channels, epoch_length)
-            self.standard_erp = np.mean(standard_array, axis=0)  # (n_channels, epoch_length)
-        
-        # 计算 P300 (target - standard)
         if self.target_erp is not None and self.standard_erp is not None:
             self.p300_erp = self.target_erp - self.standard_erp
+        return "accepted"
     
     def get_erp_data(self, channel_idx: Optional[int] = None, group_idx: Optional[int] = None) -> Dict[str, np.ndarray]:
         """
@@ -309,7 +281,6 @@ class ERPAnalyzer:
                 'n_standard': standard 试次数
             }
         """
-        self.poll_preprocessing()
         result = {
             'time': self.time_axis_ms,
             'n_target': self.n_target_trials,
@@ -319,7 +290,7 @@ class ERPAnalyzer:
             'preprocessing_status': '' if self.preprocessor is None else self.preprocessor.status_text(),
         }
         with self.event_lock:
-            result['n_pending'] = len(self.event_queue) + len(self._deferred_epochs)
+            result['n_pending'] = len(self.event_queue)
         if self.analysis_error:
             result['preprocessing_status'] += '；' + self.analysis_error
         if group_idx is not None:
@@ -359,23 +330,25 @@ class ERPAnalyzer:
         self.target_erp = None
         self.standard_erp = None
         self.p300_erp = None
+        self._target_sum = None
+        self._standard_sum = None
         self.n_target_trials = 0
         self.n_standard_trials = 0
         self.rejected_events.clear()
         self.rejection_counts.clear()
-        self._deferred_epochs.clear()
         self.trial_quality.clear()
         if self.preprocessor is not None:
             self.preprocessor.reset()
 
     def export_results(self, prefix):
-        """保存已完成的在线结果和眼电模型，原始EDF/CSV不修改。"""
+        """保存已完成的在线结果和坏导插值矩阵，原始EDF/CSV不修改。"""
         import json
-        self.poll_preprocessing()
         if self.preprocessing_pending:
-            raise RuntimeError("眼电模型尚未就绪")
+            raise RuntimeError("坏导插值初始化尚未就绪")
         shape = (0, self.n_channels, self.epoch_length)
         arrays = dict(time_ms=self.time_axis_ms,
+                      experiment_mode=np.asarray('empty_acquisition_debug' if self.preprocessor is not None
+                          and self.preprocessor.config.empty_acquisition_debug else 'experiment'),
                       target_epochs_uv=np.stack(self.target_epochs) if self.target_epochs else np.empty(shape),
                       standard_epochs_uv=np.stack(self.standard_epochs) if self.standard_epochs else np.empty(shape),
                       target_uv=self.target_erp if self.target_erp is not None else np.empty((0,)),
@@ -389,9 +362,9 @@ class ERPAnalyzer:
                           channel_names=np.asarray(self.preprocessor.channel_names))
         if self.analysis_groups and not self.analysis_error:
             indices = self._analysis_indices
-            # ERP导出仅包含关键通道。ICA输入通道单独命名，不与分析维度混淆。
+            # ERP导出仅包含关键通道。预处理输入通道单独命名，不与分析维度混淆。
             if self.preprocessor is not None:
-                arrays['ica_channel_names'] = np.asarray(self.preprocessor.channel_names)
+                arrays['preprocessing_channel_names'] = np.asarray(self.preprocessor.channel_names)
             arrays['channel_names'] = np.asarray(self.analysis_channel_names)
             for key in ('target_epochs_uv','standard_epochs_uv'):
                 arrays[key] = arrays[key][:,indices,:]
@@ -404,9 +377,7 @@ class ERPAnalyzer:
             arrays['analysis_group_labels'] = np.asarray([g['label'] for g in self.analysis_groups])
         if self.preprocessor is not None and self.preprocessor.model is not None:
             model = self.preprocessor.model
-            arrays.update(ica_projection=model['projection'], ica_offset_v=model['offset'],
-                          iclabel_probabilities=model['probabilities'],
-                          excluded_components_zero_based=np.asarray(model['excluded'], dtype=int))
+            arrays['bad_channel_interpolation'] = model['interpolation']
         np.savez_compressed(prefix + '.erp.npz', **arrays)
         metadata = dict(sample_rate=self.sample_rate, output_unit='uV', window_ms=[-self.pre_stimulus_ms, self.post_stimulus_ms],
                         window_endpoint='exclusive', baseline_ms=[-self.pre_stimulus_ms,0],
@@ -415,103 +386,14 @@ class ERPAnalyzer:
                         trial_quality=self.trial_quality,
                         analysis_channels=self.analysis_channel_names,
                         analysis_groups=[dict(label=g['label'],channels=g['channels']) for g in self.analysis_groups],
-                        quality_policy='shared_trial_mask_over_analysis_channels' if self.analysis_groups else 'all_channels',
+                        experiment_mode='empty_acquisition_debug' if self.preprocessor is not None
+                            and self.preprocessor.config.empty_acquisition_debug else 'experiment',
+                        quality_policy=('disabled_for_empty_acquisition_debug' if self.preprocessor is not None
+                            and self.preprocessor.config.empty_acquisition_debug else
+                            'shared_trial_mask_over_analysis_channels' if self.analysis_groups else 'all_channels'),
                         analysis_error=self.analysis_error,
-                        pending_events=len(self.event_queue)+len(self._deferred_epochs),
+                        pending_events=len(self.event_queue),
                         preprocessing=None if self.preprocessor is None else self.preprocessor.metadata())
         with open(prefix + '.erp.json', 'w', encoding='utf-8') as output:
             json.dump(metadata, output, ensure_ascii=False, indent=2)
 
-    # ------------------------------------------------------------------
-    # 基于硬件 trigger 通道的 epoch 提取（更精确）
-    # ------------------------------------------------------------------
-    def extract_epochs_from_trigger(
-        self,
-        packets,                    # List[DataPacket]
-        trigger_to_event: dict,     # {trigger_value: 'target'/'standard', ...}
-        eeg_view_widget=None,       # 可选：传入后用 view 的 display_data 缓存取样本
-        get_voltage_fn=None,        # 可选：自定义取电压的函数 (i) -> np.ndarray
-    ):
-        """
-        扫描 DataPacket 序列，检测 trigger 上升沿，根据 trigger 值映射到 target/standard。
-
-        Args:
-            packets: 时间顺序的 DataPacket 列表（含 trigger 字段）
-            trigger_to_event: dict，key=trigger 整数（来自 EegoTrigger.marker_from_event），
-                              value='target' / 'standard'
-            eeg_view_widget: 可选，传入后用其 buffer 取真实 EEG 电压；不传则用
-                             packets[i].voltage（电压为 V，已在 widget 显示时转换为 µV）
-            get_voltage_fn: 可选，自定义 (packet_index) -> np.ndarray 电压获取函数，
-                            优先级高于 eeg_view_widget
-
-        Returns:
-            (n_target, n_standard) 新增的 epoch 计数
-        """
-        if not packets:
-            return 0, 0
-        if self.preprocessor is not None:
-            raise RuntimeError("启用预处理时必须通过软件事件队列分段，不能绕过眼电模型")
-
-        added_target = 0
-        added_standard = 0
-        last_trigger = 0
-        ring: list = []  # 临时 ring buffer：[(ts_ms, voltage), ...]
-
-        def get_v(i: int):
-            if get_voltage_fn is not None:
-                return get_voltage_fn(i)
-            if eeg_view_widget is not None and hasattr(eeg_view_widget, 'display_data'):
-                return eeg_view_widget.display_data[i]
-            return packets[i].voltage
-
-        for i, p in enumerate(packets):
-            cur_trigger = getattr(p, 'trigger', 0) or 0
-            ring.append(p)
-            # 保持 ring buffer 不超过 epoch 长度（避免内存爆）
-            max_ring = self.epoch_length + 50
-            if len(ring) > max_ring:
-                ring = ring[-max_ring:]
-                # 重新校准 ring 的索引起点
-                ring_start = i - len(ring) + 1
-            else:
-                ring_start = i - len(ring) + 1
-
-            # 检测 trigger 上升沿（0 -> 非0）
-            if cur_trigger > 0 and last_trigger == 0:
-                # marker 落在 ring 的末尾（也就是 ring[-1]）
-                # 需要 ring 至少有 epoch_length 个样本；不足就等
-                if len(ring) < self.epoch_length:
-                    last_trigger = cur_trigger
-                    continue
-                # 取后 epoch_length 个样本
-                seg = ring[-self.epoch_length:]
-                # 找事件类型
-                evt = trigger_to_event.get(cur_trigger)
-                if evt is None:
-                    last_trigger = cur_trigger
-                    continue
-                # 提取电压矩阵
-                n_ch = self.n_channels
-                epoch_data = np.zeros((n_ch, self.epoch_length), dtype=float)
-                for k, pp in enumerate(seg):
-                    v = pp.voltage
-                    if len(v) == n_ch:
-                        epoch_data[:, k] = v
-                # 基线校正
-                if self.baseline_correction:
-                    base = np.mean(epoch_data[:, :self.pre_stimulus_samples], axis=1, keepdims=True)
-                    epoch_data = epoch_data - base
-                # 入库
-                if evt == 'target':
-                    self.target_epochs.append(epoch_data)
-                    self.n_target_trials += 1
-                    added_target += 1
-                elif evt == 'standard':
-                    self.standard_epochs.append(epoch_data)
-                    self.n_standard_trials += 1
-                    added_standard += 1
-            last_trigger = cur_trigger
-
-        if added_target or added_standard:
-            self._update_average_erp()
-        return added_target, added_standard

@@ -10,6 +10,7 @@ from PyQt5 import QtCore
 
 from shared_buffer import SharedBuffer, DataPacket
 from marker_session import MarkerSession
+from diag import debug
 
 
 # 业务侧真正需要的 32 个 EEG 导联（按显示顺序）
@@ -482,7 +483,7 @@ class DataWorker(QtCore.QObject):
 
             # ---- 通道过滤：根据 channel type 选出所有 reference + bipolar 通道 ----
             n_total = self._sdk._channel_count
-            print(f"[通道诊断] n_total={n_total}, 总通道列表:")
+            debug(f"[通道诊断] n_total={n_total}, 总通道列表:")
             channel_by_pos = []  # (stream_pos, index, type, type_name)
             for pos, ci in enumerate(self._sdk._channel_info[:n_total]):
                 t = ci.type
@@ -493,9 +494,9 @@ class DataWorker(QtCore.QObject):
                 }.get(t, f'unknown({t})')
                 channel_by_pos.append((pos, ci.index, t, tname))
                 if pos < 8 or pos >= n_total - 4:
-                    print(f"  [ch{pos}] index={ci.index:3d} type={t:2d}({tname})")
+                    debug(f"  [ch{pos}] index={ci.index:3d} type={t:2d}({tname})")
                 elif pos == 8:
-                    print("  ... (中间省略) ...")
+                    debug("  ... (中间省略) ...")
 
             # 收集所有 reference + bipolar 通道的 stream position（EEG 通道）
             # keep_stream_pos[i] = stream_position of the i-th EEG channel to keep
@@ -512,8 +513,8 @@ class DataWorker(QtCore.QObject):
             ]
             self._trigger_stream_pos = trigger_positions[0] if trigger_positions else None
             self._sample_counter_pos = sample_counter_positions[0] if sample_counter_positions else None
-            print(f"[通道过滤] EEG 通道(stream position)={len(eeg_stream_positions)}: {eeg_stream_positions}")
-            print(f"[通道过滤] Trigger stream position = {self._trigger_stream_pos}, "
+            debug(f"[通道过滤] EEG 通道(stream position)={len(eeg_stream_positions)}: {eeg_stream_positions}")
+            debug(f"[通道过滤] Trigger stream position = {self._trigger_stream_pos}, "
                   f"sample_counter stream position = {self._sample_counter_pos}")
 
             # 取前 32 个 EEG 通道
@@ -527,7 +528,7 @@ class DataWorker(QtCore.QObject):
                 for i in range(len(self._channel_index_map))
                 if i < len(STANDARD_32_CHANNELS)
             ]
-            print(f"[通道过滤] 保留 {len(self._channel_index_map)} 个 EEG 导联: {self._active_channel_names}")
+            debug(f"[通道过滤] 保留 {len(self._channel_index_map)} 个 EEG 导联: {self._active_channel_names}")
 
             self.sdkConnected.emit(len(self._active_channel_names), self._sample_rate)
             self.channelNamesAvailable.emit(self._active_channel_names)

@@ -88,6 +88,12 @@ def log(msg: str, *args) -> None:
                     pass
 
 
+def debug(msg: str, *args) -> None:
+    """Opt-in verbose output; errors and lifecycle messages remain visible."""
+    if os.environ.get('EEG_VR_DEBUG', '').lower() in {'1', 'true', 'yes'}:
+        log(msg, *args)
+
+
 def log_exc(msg: str = "") -> None:
     """输出消息 + 当前异常 traceback（如果在 except 块中调用）"""
     if msg:

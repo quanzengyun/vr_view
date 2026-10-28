@@ -1,7 +1,7 @@
-"""在线 ERP 预处理：固定 FIR、后台 ICA/ICLabel、仅去除眼电成分。
+"""在线 ERP：1–10 Hz FIR、固定坏导球面插值、重参考（全通道平均参考）。
 
 原始 EEG/EDF 不修改。FIR 群延迟通过输出样本的原始时间补偿，而非移动标签。
-ICA 只在本次记录的校准数据上拟合一次；所有试次使用同一组权重。
+坏导初始化后固定插值矩阵；连续数据先重参考，再提取试次。不执行ICA或眼电成分去除。
 """
 from dataclasses import dataclass, asdict
 import threading
@@ -11,70 +11,74 @@ from scipy.signal import lfilter
 
 @dataclass(frozen=True)
 class ERPPreprocessingConfig:
+    empty_acquisition_debug: bool = False
     low_hz: float = 1.0
-    high_hz: float = 30.0
-    calibration_seconds: float = 60.0
-    minimum_calibration_seconds: float = 30.0
-    eye_probability: float = 0.8
-    max_eye_components: int = 2
+    high_hz: float = 10.0
+    calibration_seconds: float = 10.0
+    minimum_calibration_seconds: float = 3.0
     amplitude_uv: float = 100.0
     variance_uv2: float = 1000.0
+    bad_window_samples: int = 500
+    bad_overlap: float = 0.5
+    bad_amplitude_uv: float = 200.0
+    bad_special_amplitude_uv: float = 150.0
+    bad_amplitude_ratio: float = 0.7
+    bad_flat_ratio: float = 0.95
+    bad_flat_range_uv: float = 20.0
 
 
-def select_eye_components(probabilities, threshold=0.8, maximum=2):
-    probabilities = np.asarray(probabilities, dtype=float)
-    if probabilities.ndim != 2 or probabilities.shape[1] != 7 or not np.all(np.isfinite(probabilities)):
-        raise ValueError("ICLabel 分类概率无效")
-    candidates = np.flatnonzero(probabilities[:, 2] >= threshold)
-    return candidates[np.argsort(-probabilities[candidates, 2], kind="stable")][:maximum].tolist()
+def detect_bad_channels(data_volts, channel_names, config):
+    """Port of detect_bad_electrodes.m: channels 27–30 use the special threshold."""
+    data = np.asarray(data_volts) * 1e6  # time x channels, microvolts
+    window = config.bad_window_samples
+    step = int(np.floor(window * (1 - config.bad_overlap) + 0.5))
+    if step < 1 or len(data) < window:
+        raise ValueError("坏导检测数据不足或滑窗参数无效")
+    starts = range(0, len(data) - window + 1, step)
+    peaks = np.array([np.max(np.abs(data[s:s+window]), axis=0) for s in starts])
+    ranges = np.array([np.ptp(data[s:s+window], axis=0) for s in starts])
+    thresholds = np.full(data.shape[1], config.bad_amplitude_uv)
+    thresholds[26:30] = config.bad_special_amplitude_uv
+    high = np.mean(peaks > thresholds, axis=0)
+    flat = np.mean(ranges < config.bad_flat_range_uv, axis=0)
+    bad = (high > config.bad_amplitude_ratio) | (flat > config.bad_flat_ratio)
+    stats = [dict(channel=name, high_amplitude_ratio=float(high[i]),
+                  flat_signal_ratio=float(flat[i]), bad=bool(bad[i]))
+             for i, name in enumerate(channel_names)]
+    return np.flatnonzero(bad).tolist(), stats
 
 
-def fit_eye_model(data, channel_names, sample_rate, config):
-    """与 MATLAB 同样用 ICLabel 第3类、>=0.8、最多两个，不删除其他类别。"""
+def build_interpolation_model(filtered_data, channel_names, sample_rate, config):
+    """Build only a spherical interpolation matrix from filtered calibration data."""
     import mne
-    from mne.preprocessing import ICA
-    from mne_icalabel.iclabel import iclabel_label_components
-    from threadpoolctl import threadpool_limits
-
-    info = mne.create_info(channel_names, sample_rate, "eeg")
-    raw = mne.io.RawArray(np.asarray(data).T, info, verbose="ERROR")
-    raw.set_montage(mne.channels.make_standard_montage("standard_1020"), match_case=False, on_missing="raise")
-    # ICLabel 的训练输入约定为1–100 Hz；这是校准副本，不是多频段ERP分析。
-    raw.filter(1.0, 100.0, verbose="ERROR")
-    raw.set_eeg_reference("average", projection=False, verbose="ERROR")
-    rank = mne.compute_rank(raw, verbose="ERROR")["eeg"]
-    if rank < 2:
-        raise ValueError("校准数据的独立通道不足，不能拟合眼电模型")
-    with threadpool_limits(limits=2):
-        ica = ICA(n_components=rank, method="infomax", fit_params=dict(extended=True),
-                  random_state=97, max_iter=512, verbose="ERROR")
-        # 仅拟合时抽样加速；采集、保存和ERP时间轴仍是原采样率。
-        ica.fit(raw, decim=4, verbose="ERROR")
-        probabilities = iclabel_label_components(raw, ica, inplace=False, backend="onnx")
-    exclude = select_eye_components(probabilities, config.eye_probability, config.max_eye_components)
-    # 用公开apply接口构造固定仿射映射，在线无需反复创建MNE对象或重训ICA。
+    # Streaming FIR has no zero-padded end edge. Ignore its initial transient.
+    edge = int(round(2 * sample_rate))
+    detection = np.asarray(filtered_data)[edge:]
+    bad, stats = detect_bad_channels(detection, channel_names, config)
     channels = len(channel_names)
-    basis = np.column_stack([np.zeros(channels), np.eye(channels) * 1e-6])
-    probe = mne.io.RawArray(basis, raw.info.copy(), verbose="ERROR")
-    cleaned = ica.apply(probe, exclude=exclude, verbose="ERROR").get_data()
-    offset = cleaned[:, 0]
-    projection = (cleaned[:, 1:] - offset[:, None]) / 1e-6
-    validation = raw.copy().crop(tmin=0, tmax=2)
-    direct = ica.apply(validation.copy(), exclude=exclude, verbose="ERROR").get_data()
-    affine = projection @ validation.get_data() + offset[:, None]
-    if not np.allclose(affine, direct, rtol=1e-8, atol=1e-12):
-        raise ValueError("眼电投影与ICA.apply验证不一致")
-    return dict(projection=projection, offset=offset, probabilities=probabilities,
-                excluded=exclude, rank=int(rank), iterations=int(ica.n_iter_))
+    interpolation = np.eye(channels)
+    if bad:
+        if channels - len(bad) < 4:
+            raise ValueError("坏导检测后有效通道不足4个，不能可靠球面插值；请检查电极或检测阈值")
+        info = mne.create_info(channel_names, sample_rate, "eeg")
+        probe = mne.io.RawArray(np.eye(channels), info, verbose="ERROR")
+        probe.set_montage(mne.channels.make_standard_montage("standard_1020"),
+                          match_case=False, on_missing="raise")
+        probe.info['bads'] = [channel_names[i] for i in bad]
+        probe.interpolate_bads(reset_bads=True, method=dict(eeg='spline'), verbose="ERROR")
+        interpolation = probe.get_data()
+    return dict(interpolation=interpolation, bad_channels=[channel_names[i] for i in bad],
+                bad_channel_stats=stats)
 
 
 class OnlineERPPreprocessor:
-    def __init__(self, channel_names, sample_rate=1000.0, config=None, fit_function=None):
+    def __init__(self, channel_names, sample_rate=1000.0, config=None, model_function=None):
         import mne
         self.channel_names = list(channel_names)
         self.sample_rate = float(sample_rate)
         self.config = config or ERPPreprocessingConfig()
-        self._fit_function = fit_function or fit_eye_model
+        self.continuous_output = True
+        self._model_function = model_function or build_interpolation_model
         self._lock = threading.RLock()
         self._generation = 0
         self.taps = mne.filter.create_filter(None, self.sample_rate,
@@ -92,20 +96,25 @@ class OnlineERPPreprocessor:
             self._calibration_count = 0
             self._input_count = 0
             self._anchor_ms = None
+            self._pending_filtered = []
             self._zi = np.zeros((len(self.taps) - 1, len(self.channel_names)))
+            if self.config.empty_acquisition_debug:
+                self.model = dict(interpolation=np.eye(len(self.channel_names)),
+                                  bad_channels=[], bad_channel_stats=[])
+                self.state = "ready"
 
-    def _start_fit(self):
+    def _start_setup(self):
         with self._lock:
             if self.state != "collecting":
                 return
             data = np.concatenate(self._calibration, axis=0)
             self._calibration.clear()
             generation = self._generation
-            self.state = "fitting"
+            self.state = "processing"
 
         def work():
             try:
-                model = self._fit_function(data, self.channel_names, self.sample_rate, self.config)
+                model = self._model_function(data, self.channel_names, self.sample_rate, self.config)
                 with self._lock:
                     if generation == self._generation:
                         self.model = model
@@ -115,11 +124,11 @@ class OnlineERPPreprocessor:
                     if generation == self._generation:
                         self.error = str(exc)
                         self.state = "error"
-        threading.Thread(target=work, daemon=True, name="ERP-ICA-ICLabel").start()
+        threading.Thread(target=work, daemon=True, name="ERP-Bad-Channel-Setup").start()
 
     def process_batch(self, packets):
         if not packets:
-            return []
+            return self._drain_cleaned()
         if self.state == "error":
             return []
         try:
@@ -131,20 +140,21 @@ class OnlineERPPreprocessor:
                 raise ValueError("ERP输入采样索引不连续")
             if self._anchor_ms is None:
                 self._anchor_ms = float(packets[0].timestamp)
-            if self.state == "collecting":
-                needed = int(round(self.config.calibration_seconds * self.sample_rate)) - self._calibration_count
-                take = min(len(data), max(needed, 0))
-                if take:
-                    self._calibration.append(data[:take].copy())
-                    self._calibration_count += take
-                if self._calibration_count >= self.config.calibration_seconds * self.sample_rate:
-                    self._start_fit()
             filtered, self._zi = lfilter(self.taps, [1.0], data, axis=0, zi=self._zi)
             aligned = np.arange(self._input_count, self._input_count + len(data)) - self.delay_samples
             self._input_count += len(data)
             keep = aligned >= 0
-            return [(self._anchor_ms + int(i) * 1000.0 / self.sample_rate, row)
-                    for i, row in zip(aligned[keep], filtered[keep])]
+            if np.any(keep):
+                self._pending_filtered.append((aligned[keep], filtered[keep].copy()))
+                if self.state == "collecting":
+                    needed = int(round(self.config.calibration_seconds * self.sample_rate)) - self._calibration_count
+                    take = min(int(keep.sum()), max(needed, 0))
+                    if take:
+                        self._calibration.append(filtered[keep][:take].copy())
+                        self._calibration_count += take
+                    if self._calibration_count >= self.config.calibration_seconds * self.sample_rate:
+                        self._start_setup()
+            return self._drain_cleaned()
         except Exception as exc:
             with self._lock:
                 self._generation += 1
@@ -152,23 +162,37 @@ class OnlineERPPreprocessor:
                 self.error, self.state = str(exc), "error"
             return []
 
-    def clean_epoch_uv(self, epoch_volts):
+    def _drain_cleaned(self):
+        """Apply fixed interpolation and re-reference to continuous data before epoching."""
+        with self._lock:
+            if self.state != 'ready' or self.model is None:
+                return []
+            pending, self._pending_filtered = self._pending_filtered, []
+        frames = []
+        from threadpoolctl import threadpool_limits
+        with threadpool_limits(limits=2):
+            for indices, data in pending:
+                cleaned = self.process_samples_uv(data.T).T * 1e-6
+                frames.extend((self._anchor_ms + int(i) * 1000.0 / self.sample_rate, row)
+                              for i, row in zip(indices, cleaned))
+        return frames
+
+    def process_samples_uv(self, epoch_volts):
+        """Fixed spatial transform for any continuous channels-by-time block."""
         with self._lock:
             model = self.model
         if model is None:
             return None
-        centered = epoch_volts - epoch_volts.mean(axis=0, keepdims=True)
-        cleaned = model["projection"] @ centered + model["offset"][:, None]
-        # 保留所有通道，统一为全通道平均参考。
-        cleaned -= cleaned.mean(axis=0, keepdims=True)
-        return cleaned * 1e6
+        interpolated = model.get('interpolation', np.eye(len(self.channel_names))) @ epoch_volts
+        rereferenced = interpolated - interpolated.mean(axis=0, keepdims=True)
+        return rereferenced * 1e6
 
     def finish_collection(self):
         if self.state == "collecting":
             if self._calibration_count >= self.config.minimum_calibration_seconds * self.sample_rate:
-                self._start_fit()
+                self._start_setup()
             else:
-                self.error = f"眼电校准数据不足{self.config.minimum_calibration_seconds:g}秒"
+                self.error = f"坏导初始化数据不足{self.config.minimum_calibration_seconds:g}秒"
                 self.state = "insufficient"
 
     def metadata(self):
@@ -177,21 +201,28 @@ class OnlineERPPreprocessor:
             return dict(config=asdict(self.config), state=self.state, error=self.error,
                         channels=self.channel_names, sample_rate=self.sample_rate,
                         calibration_samples=self._calibration_count, filter_delay_samples=self.delay_samples,
-                        eye_components=[] if model is None else model["excluded"],
-                        eye_probabilities=[] if model is None else model["probabilities"][:, 2].tolist(),
-                        rank=None if model is None else model["rank"],
-                        ica_iterations=None if model is None else model["iterations"],
-                        ica_iteration_limit=512, ica_method="extended_infomax", random_seed=97,
-                        montage="standard_1020", classification_backend="onnx",
-                        reference="all_channel_average", output_unit="uV",
-                        ica_training_filter_hz=[1,100], bad_channel_removal=False)
+                        ica_enabled=False, ocular_correction=False,
+                        reference="all_channel_average", reference_name="重参考（全通道平均参考）",
+                        output_unit="uV", bad_channel_removal=False,
+                        experiment_mode='empty_acquisition_debug' if self.config.empty_acquisition_debug else 'experiment',
+                        trial_rejection_enabled=not self.config.empty_acquisition_debug,
+                        bad_channel_method='disabled_for_debug' if self.config.empty_acquisition_debug else 'spherical_spline_interpolation',
+                        bad_channels=[] if model is None else model['bad_channels'],
+                        bad_channel_stats=[] if model is None else model['bad_channel_stats'],
+                        processing_order=(['continuous_1_10_hz_filter','rereference','epoch','baseline','erp']
+                            if self.config.empty_acquisition_debug else
+                            ['continuous_1_10_hz_filter','bad_channel_interpolation',
+                             'rereference','epoch','baseline','trial_rejection','erp']))
 
     def status_text(self):
-        prefix = f"整体{self.config.low_hz:g}–{self.config.high_hz:g}Hz；平均参考；滤波延迟已补偿{self.delay_samples/self.sample_rate:.2f}s。"
+        prefix = f"整体{self.config.low_hz:g}–{self.config.high_hz:g}Hz；重参考（全通道平均参考）。"
+        if self.config.empty_acquisition_debug:
+            return ('空采调试（非实验分析）：' + prefix + '跳过坏导检测与试次剔除'
+                    if self.state == 'ready' else f'空采调试预处理不可用：{self.error}')
         if self.state == "collecting":
-            return prefix + f"眼电校准 {self._calibration_count/self.sample_rate:.1f}/{self.config.calibration_seconds:g}s"
-        if self.state == "fitting":
-            return prefix + "ICA/ICLabel后台拟合中，完整试次暂存"
+            return prefix + f"坏导初始化 {self._calibration_count/self.sample_rate:.1f}/{self.config.calibration_seconds:g}s"
+        if self.state == "processing":
+            return prefix + "坏导检测与插值初始化中"
         if self.state == "ready":
-            return prefix + f"眼电模型就绪：去除{len(self.model['excluded'])}个成分"
+            return prefix + f"插值{len(self.model['bad_channels'])}个坏导"
         return f"ERP预处理未就绪：{self.error}"

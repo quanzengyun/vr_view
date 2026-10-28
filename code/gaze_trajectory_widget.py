@@ -1,5 +1,6 @@
 """Independent, time-fading viewport gaze trace (no scene/world tracking)."""
 
+import csv
 import math
 import threading
 import time
@@ -14,12 +15,14 @@ class GazeTrajectoryWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(300, 220)
-        self.trail_seconds = 3.0
+        self.trail_seconds = 5.0
         self.gap_seconds = 0.25
         self._points = deque(maxlen=4096)
         self._lock = threading.Lock()
         self._break_pending = True
         self._clock = time.monotonic
+        self._record_started = None
+        self._record_rows = []
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._refresh)
         self._timer.start(33)
@@ -40,7 +43,30 @@ class GazeTrajectoryWidget(QtWidgets.QWidget):
                          and 0 <= now - self._points[-1][0] <= self.gap_seconds)
             # Unity viewport has its origin at the bottom left; Qt uses top left.
             self._points.append((now, x, 1.0 - y, connected))
+            if self._record_started is not None and now >= self._record_started:
+                self._record_rows.append((time.time_ns() / 1e6,
+                    now - self._record_started, x, y,
+                    int(connected and bool(self._record_rows))))
             self._break_pending = False
+
+    def start_recording(self):
+        with self._lock:
+            self._record_started = self._clock()
+            self._record_rows = []
+
+    def stop_recording(self):
+        with self._lock:
+            self._record_started = None
+
+    def save_csv(self, path):
+        """保存整次实验的有效注视点；坐标保持 Unity 原始归一化 X/Y。"""
+        with self._lock:
+            rows = list(self._record_rows)
+        with open(path, 'w', newline='', encoding='utf-8-sig') as output:
+            writer = csv.writer(output)
+            writer.writerow(['timestamp_ms', 'elapsed_s', 'gaze_x', 'gaze_y',
+                             'connected_to_previous'])
+            writer.writerows(rows)
 
     def break_trace(self):
         """Preserve the fading tail but never join it to a new connection."""
@@ -97,7 +123,7 @@ class GazeTrajectoryWidget(QtWidgets.QWidget):
         painter.drawText(QtCore.QPointF(rect.center().x(), rect.bottom() + 18), 'X')
         painter.drawText(QtCore.QPointF(rect.left() - 26, rect.center().y()), 'Y')
         active = bool(points) and now - points[-1][0] <= self.gap_seconds
-        painter.drawText(12, 22, '实时注视 · 最近 3 秒' if active else '等待注视数据 · 旧轨迹逐渐淡出')
+        painter.drawText(12, 22, '实时注视 · 最近 5 秒' if active else '等待注视数据 · 旧轨迹逐渐淡出')
 
         def position(point):
             return QtCore.QPointF(rect.left() + point[1] * rect.width(),

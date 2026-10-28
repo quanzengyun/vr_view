@@ -21,7 +21,7 @@ try:
 except ImportError:
     _HAS_SERIAL = False
 
-from diag import log, log_exc
+from diag import log, log_exc, debug
 
 
 class EegoTrigger:
@@ -67,13 +67,13 @@ class EegoTrigger:
         这里保持字节级兼容——发同样的 2 字节序列给同一接收端。
         """
         if not self._enabled or self._ser is None:
-            log(f"[EegoTrigger] send({label}) 被跳过：触发器未启用（串口未打开或无硬件）")
+            debug(f"[EegoTrigger] send({label}) 被跳过：触发器未启用（串口未打开或无硬件）")
             return
         with self._lock:
             try:
                 head = 0x00
                 self._ser.write(bytes([head, label & 0xFF]))
-                log(f"[EegoTrigger] send label={label} (0x{label:02X}) OK")
+                debug(f"[EegoTrigger] send label={label} (0x{label:02X}) OK")
             except Exception:
                 log_exc(f"[EegoTrigger] 写入失败 label={label}，后续 send 将被禁用:")
                 self._enabled = False

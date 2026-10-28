@@ -179,7 +179,7 @@ class ERPViewWidget(QtWidgets.QWidget):
         erp_data = self.erp_analyzer.get_erp_data(channel_idx=self.selected_channel_idx, group_idx=self.selected_group_idx)
         reasons = {'amplitude_artifact':'振幅超限', 'variance_artifact':'方差超限',
                    'incomplete_post_stimulus_at_stop':'停止时后窗不足',
-                   'eye_model_unavailable':'眼电模型不可用'}
+                   'preprocessing_unavailable':'预处理不可用'}
         counts = self.erp_analyzer.rejection_counts
         details = '；'.join(f'{label}: {counts[reason]}' for reason,label in reasons.items() if counts[reason])
         self.preprocessing_label.setText(erp_data['preprocessing_status'] + ('；'+details if details else ''))

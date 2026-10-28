@@ -1,28 +1,16 @@
-"""
-VR 视频接收器（独立 TCP，端口 12346）
-对应 PICO.cs 视频流协议：
-  [4B 魔数 'V','R','V','F'] [4B seq][4B len] [len B JPEG]
-特点：
-  - 独立 TCP 连接（不和 trigger 12345 串）
-  - 自带丢帧：PC 解码太慢时跳过中间帧，永远显示最新
-  - 30 fps 目标，640x360 JPEG
-  - OpenCV 显示窗口：左上是视频，右上是 trigger 状态
-"""
+"""独立 TCP 视频接收器：VRVF + 小端 seq、JPEG 长度 + JPEG 数据。"""
 
 import io
 import socket
 import struct
 import threading
 import time
-from collections import deque
 from typing import Callable, Optional
 
 import numpy as np
+from diag import log_exc
 
-try:
-    from PIL import Image
-except ImportError:
-    raise ImportError("需要安装 pillow: pip install pillow")
+from PIL import Image
 
 try:
     import cv2
@@ -53,7 +41,6 @@ class VRVideoReceiver:
         self._server_sock: Optional[socket.socket] = None
         self._client_sock: Optional[socket.socket] = None
         self._accept_thread: Optional[threading.Thread] = None
-        self._recv_thread: Optional[threading.Thread] = None
 
         # 统计
         self.total_frames = 0
@@ -62,6 +49,8 @@ class VRVideoReceiver:
         self.fps_counter = 0
         self.fps_timer = time.time()
         self.current_fps = 0.0
+        self.callback_errors = 0
+        self._last_callback_error_time = None
 
         # 最新帧（GUI 直接读）
         self.latest_frame: Optional[np.ndarray] = None
@@ -70,64 +59,74 @@ class VRVideoReceiver:
 
     # ---------- 生命周期 ----------
     def start(self) -> bool:
-        if self.is_running:
+        if self.is_running or (self._accept_thread and self._accept_thread.is_alive()):
             return False
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((self.host, self.port))
+            server.listen(1)
+            server.settimeout(0.5)
+        except OSError as exc:
+            server.close()
+            print(f"[VRVideo] 监听失败: {exc}")
+            return False
+        self._server_sock = server
         self.is_running = True
-        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._accept_thread = threading.Thread(target=self._accept_loop, args=(server,),
+                                               daemon=True, name="VR-Video-Receiver")
         self._accept_thread.start()
+        print(f"[VRVideo] 监听 {self.host}:{server.getsockname()[1]} ...")
         return True
 
     def stop(self):
         self.is_running = False
-        for s in (self._client_sock, self._server_sock):
-            try:
-                if s: s.close()
-            except Exception:
-                pass
-        self._client_sock = None
+        self._close_socket(self._client_sock)
+        self._close_socket(self._server_sock)
+        if self._accept_thread and self._accept_thread is not threading.current_thread():
+            self._accept_thread.join(timeout=2.0)
         self._server_sock = None
 
-    # ---------- 网络 ----------
-    def _accept_loop(self):
-        """接受 VR 端连接"""
+    @staticmethod
+    def _close_socket(sock):
+        if sock is None:
+            return
         try:
-            self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._server_sock.bind((self.host, self.port))
-            self._server_sock.listen(1)
-            print(f"[VRVideo] 监听 {self.host}:{self.port} ...")
-        except Exception as e:
-            print(f"[VRVideo] 绑定失败: {e}")
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass  # 监听 socket 或已断开的 socket 无需 shutdown。
+        sock.close()
+
+    # ---------- 网络 ----------
+    def _accept_loop(self, server):
+        """单线程依次接受、接收和关闭连接；断开后继续等待头显。"""
+        try:
+            while self.is_running:
+                try:
+                    client, addr = server.accept()
+                except socket.timeout:
+                    continue
+                with client:
+                    if not self.is_running:
+                        break
+                    self._client_sock = client
+                    print(f"[VRVideo] VR 端已连接: {addr}")
+                    try:
+                        self._recv_loop(client)
+                    except OSError as exc:
+                        if self.is_running:
+                            print(f"[VRVideo] 接收中断: {exc}")
+                    finally:
+                        self._client_sock = None
+        except OSError as exc:
+            if self.is_running:
+                print(f"[VRVideo] accept 异常: {exc}")
+        finally:
+            server.close()
+            self._server_sock = None
             self.is_running = False
-            return
 
-        while self.is_running:
-            try:
-                self._server_sock.settimeout(1.0)
-                client, addr = self._server_sock.accept()
-                print(f"[VRVideo] VR 端已连接: {addr}")
-                # 关闭旧连接
-                if self._client_sock:
-                    try: self._client_sock.close()
-                    except Exception: pass
-                self._client_sock = client
-                # 启接收线程
-                if self._recv_thread and self._recv_thread.is_alive():
-                    # 让旧的循环自然退出
-                    pass
-                self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
-                self._recv_thread.start()
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self.is_running:
-                    print(f"[VRVideo] accept 异常: {e}")
-                break
-
-    def _recv_loop(self):
-        sock = self._client_sock
-        if not sock:
-            return
+    def _recv_loop(self, sock):
         buf = b''
         sock.settimeout(0.5)
         while self.is_running and self._client_sock is sock:
@@ -139,10 +138,6 @@ class VRVideoReceiver:
                 buf += chunk
             except socket.timeout:
                 continue
-            except Exception as e:
-                if self.is_running:
-                    print(f"[VRVideo] recv 异常: {e}")
-                break
 
             # 解析：只要能解析出完整帧就解析
             while len(buf) >= HEADER_SIZE:
@@ -196,7 +191,12 @@ class VRVideoReceiver:
                     try:
                         self.on_frame(frame, seq)
                     except Exception:
-                        pass
+                        self.callback_errors += 1
+                        now = time.monotonic()
+                        if (self._last_callback_error_time is None
+                                or now - self._last_callback_error_time >= 5.0):
+                            self._last_callback_error_time = now
+                            log_exc(f"[VRVideo] 显示回调失败 seq={seq}（同类错误每5秒记录一次）:")
 
     # ---------- 解码 ----------
     def _decode(self, jpg: bytes) -> Optional[np.ndarray]:
@@ -217,6 +217,7 @@ class VRVideoReceiver:
             'dropped_frames': self.dropped_frames,
             'last_seq': self.last_seq,
             'fps': round(self.current_fps, 1),
+            'callback_errors': self.callback_errors,
         }
 
 
