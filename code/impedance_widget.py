@@ -226,6 +226,8 @@ class _HeadOutlineItem(QtWidgets.QGraphicsItem):
         super().__init__()
         self._w = scene_w
         self._h = scene_h
+        self.head_rect = QtCore.QRectF(scene_w * 0.10, scene_h * 0.04,
+                                      scene_w * 0.80, scene_h * 0.96)
         self.setZValue(-10)
 
     def boundingRect(self) -> QtCore.QRectF:
@@ -235,22 +237,19 @@ class _HeadOutlineItem(QtWidgets.QGraphicsItem):
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
         if self._w < 10 or self._h < 10:
             return
-        head_rect = QtCore.QRectF(
-            self._w * 0.10, self._h * 0.04,
-            self._w * 0.80, self._h * 0.96,
-        )
+        head_rect = self.head_rect
         painter.setPen(QtGui.QPen(QtGui.QColor(_SELECT), 3))
         painter.setBrush(QtGui.QColor(_BG_HEAD))
         painter.drawEllipse(head_rect)
         # 中心十字线
         painter.setPen(QtGui.QPen(QtGui.QColor(_BORDER), 1, QtCore.Qt.DashLine))
         painter.drawLine(
-            int(head_rect.center().x()), int(head_rect.top()),
-            int(head_rect.center().x()), int(head_rect.bottom()),
+            QtCore.QPointF(head_rect.center().x(), head_rect.top()),
+            QtCore.QPointF(head_rect.center().x(), head_rect.bottom()),
         )
         painter.drawLine(
-            int(head_rect.left()), int(head_rect.center().y()),
-            int(head_rect.right()), int(head_rect.center().y()),
+            QtCore.QPointF(head_rect.left(), head_rect.center().y()),
+            QtCore.QPointF(head_rect.right(), head_rect.center().y()),
         )
         # 鼻子（俯视图，鼻尖朝向画布上方，与 forehead 同侧，指向画外）
         cx = head_rect.center().x()
@@ -277,6 +276,12 @@ class _HeadOutlineItem(QtWidgets.QGraphicsItem):
 # ============================================================================
 # 主 widget
 # ============================================================================
+
+class _HeadView(QtWidgets.QGraphicsView):
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.fitInView(self.sceneRect(), QtCore.Qt.KeepAspectRatio)
+
 
 class ImpedanceWidget(QtWidgets.QDialog):
     """
@@ -359,15 +364,31 @@ class ImpedanceWidget(QtWidgets.QDialog):
         self.head_outline_item = _HeadOutlineItem(self.SCENE_W, self.SCENE_H)
         self.scene.addItem(self.head_outline_item)
 
-        # 电极
+        # 以 Cz 为共同原点平移整套电极，保留原相对间距，不能只移动 Cz。
+        cz_x, cz_y = ELECTRODE_POSITIONS_64["Cz"]
+        center = self.head_outline_item.head_rect.center()
+        # Cz 保持中心，纵向统一压缩至头部椭圆内；为电极圆点留出边距。
+        head = self.head_outline_item.head_rect
+        rx, ry = head.width() / 2 - 12, head.height() / 2 - 12
+        y_scale = 1.0
+        for name in ELECTRODES_64_ORDERED:
+            if name in {"EOG", "M1", "M2"}:
+                continue  # 眼电和乳突电极本来就在头皮轮廓外。
+            nx, ny = ELECTRODE_POSITIONS_64[name]
+            dx, dy = (nx - cz_x) * self.SCENE_W, (ny - cz_y) * self.SCENE_H
+            if dy:
+                allowed_y = ry * math.sqrt(max(0.0, 1 - (dx / rx) ** 2))
+                y_scale = min(y_scale, allowed_y / abs(dy))
         for name in ELECTRODES_64_ORDERED:
             nx, ny = ELECTRODE_POSITIONS_64[name]
             item = _ElectrodeItem(name, nx, ny, radius_px=7.5)
-            item.setPos(nx * self.SCENE_W, ny * self.SCENE_H)
+            item.setPos(center.x() + (nx - cz_x) * self.SCENE_W,
+                        center.y() + (ny - cz_y) * self.SCENE_H * y_scale)
             self.scene.addItem(item)
             self._electrode_items[name] = item
 
-        self.view = QtWidgets.QGraphicsView(self.scene)
+        self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-12, -12, 12, 12))
+        self.view = _HeadView(self.scene)
         self.view.setRenderHints(
             QtGui.QPainter.Antialiasing | QtGui.QPainter.TextAntialiasing
         )
