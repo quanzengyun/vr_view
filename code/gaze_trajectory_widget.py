@@ -7,6 +7,7 @@ import time
 from collections import deque
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from biostyle import PLOT, BORDER, MUTED, ORANGE
 
 
 class GazeTrajectoryWidget(QtWidgets.QWidget):
@@ -106,16 +107,16 @@ class GazeTrajectoryWidget(QtWidgets.QWidget):
         points = self.visible_points(now)
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        painter.fillRect(self.rect(), QtGui.QColor('#111d30'))
+        painter.fillRect(self.rect(), QtGui.QColor(PLOT))
         rect = self.plot_rect()
-        painter.setPen(QtGui.QPen(QtGui.QColor('#31435e'), 1))
-        painter.setBrush(QtGui.QColor('#15243a'))
+        painter.setPen(QtGui.QPen(QtGui.QColor(BORDER), 1))
+        painter.setBrush(QtGui.QColor(PLOT))
         painter.drawRect(rect)
         for i in range(1, 4):
             x, y = rect.left() + rect.width() * i / 4, rect.top() + rect.height() * i / 4
             painter.drawLine(QtCore.QPointF(x, rect.top()), QtCore.QPointF(x, rect.bottom()))
             painter.drawLine(QtCore.QPointF(rect.left(), y), QtCore.QPointF(rect.right(), y))
-        painter.setPen(QtGui.QColor('#bacbe0'))
+        painter.setPen(QtGui.QColor(MUTED))
         painter.drawText(QtCore.QPointF(rect.left() - 20, rect.top() + 5), '1')
         painter.drawText(QtCore.QPointF(rect.left() - 20, rect.bottom()), '0')
         painter.drawText(QtCore.QPointF(rect.left(), rect.bottom() + 18), '0')
@@ -130,7 +131,7 @@ class GazeTrajectoryWidget(QtWidgets.QWidget):
                                  rect.top() + point[2] * rect.height())
 
         def color(point):
-            c = QtGui.QColor('#ff7b54')
+            c = QtGui.QColor(ORANGE)
             c.setAlphaF(self.opacity(point[0], now))
             return c
 

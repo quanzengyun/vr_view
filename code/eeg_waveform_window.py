@@ -12,6 +12,8 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
 from shared_buffer import SharedBuffer, DataPacket
+from biostyle import apply_theme, style_plot, PLOT, BORDER, MUTED
+from eeg_view.channel_meta import get_channel_color
 
 
 # 标准 32 导联
@@ -25,41 +27,7 @@ STANDARD_32_CHANNELS: List[str] = [
     "POz", "O1", "Oz", "O2",
 ]
 
-CHANNEL_COLORS: List[QtGui.QColor] = [
-    # 每通道一个颜色，便于区分
-    QtGui.QColor(220, 20, 60),   # Fp1
-    QtGui.QColor(255, 69, 0),    # Fpz
-    QtGui.QColor(255, 140, 0),   # Fp2
-    QtGui.QColor(0, 139, 0),     # F7
-    QtGui.QColor(50, 205, 50),   # F3
-    QtGui.QColor(0, 191, 255),   # Fz
-    QtGui.QColor(30, 144, 255),  # F4
-    QtGui.QColor(138, 43, 226),  # F8
-    QtGui.QColor(255, 20, 147),  # FC5
-    QtGui.QColor(255, 105, 180), # FC1
-    QtGui.QColor(199, 21, 133),  # FC2
-    QtGui.QColor(219, 112, 147), # FC6
-    QtGui.QColor(75, 0, 130),    # T7
-    QtGui.QColor(65, 105, 225),  # C3
-    QtGui.QColor(100, 149, 237), # Cz
-    QtGui.QColor(72, 61, 139),   # C4
-    QtGui.QColor(70, 130, 180),  # T8
-    QtGui.QColor(0, 191, 255),   # M1
-    QtGui.QColor(60, 179, 113),  # CP5
-    QtGui.QColor(46, 139, 87),   # CP1
-    QtGui.QColor(34, 139, 34),   # CP2
-    QtGui.QColor(107, 142, 35),  # CP6
-    QtGui.QColor(0, 100, 0),     # M2
-    QtGui.QColor(139, 69, 19),   # P7
-    QtGui.QColor(160, 82, 45),   # P3
-    QtGui.QColor(205, 133, 63),   # Pz
-    QtGui.QColor(210, 105, 30),  # P4
-    QtGui.QColor(255, 165, 0),   # P8
-    QtGui.QColor(255, 69, 0),    # POz
-    QtGui.QColor(178, 34, 34),   # O1
-    QtGui.QColor(188, 143, 143),  # Oz
-    QtGui.QColor(165, 42, 42),   # O2
-]
+CHANNEL_COLORS: List[QtGui.QColor] = [get_channel_color(name) for name in STANDARD_32_CHANNELS]
 
 
 class EEGWaveformWindow(QtWidgets.QWidget):
@@ -110,6 +78,7 @@ class EEGWaveformWindow(QtWidgets.QWidget):
     # -------------------- UI Setup -------------------- #
 
     def _init_ui(self) -> None:
+        apply_theme(self)
         self.setWindowTitle("EEG 波形")
         self.setMinimumSize(1000, 700)
 
@@ -130,10 +99,11 @@ class EEGWaveformWindow(QtWidgets.QWidget):
         self._label_layout.setContentsMargins(4, 4, 4, 4)
         self._label_layout.setSpacing(0)
         self._label_widget.setFixedWidth(90)
-        self._label_widget.setStyleSheet("background: #F8F8F8; border-right: 1px solid #CCCCCC;")
+        self._label_widget.setStyleSheet(f"background: {PLOT}; border-right: 1px solid {BORDER};")
 
         # 右侧：pyqtgraph 绘图区
-        self.plot = pg.PlotWidget(background="w")
+        self.plot = pg.PlotWidget(background=PLOT)
+        style_plot(self.plot)
         self.plot.showGrid(x=True, y=True)
         self.plot.setMouseEnabled(x=True, y=False)
         self.plot.setXRange(0, self._window_sec)
@@ -269,7 +239,7 @@ class EEGWaveformWindow(QtWidgets.QWidget):
             scale_label = QtWidgets.QLabel("0 µV")
             scale_label.setFixedWidth(48)
             scale_label.setAlignment(QtCore.Qt.AlignCenter)
-            scale_label.setStyleSheet("color: #888; font-size: 9px;")
+            scale_label.setStyleSheet(f"color: {MUTED}; font-size: 9px;")
             row_layout.addWidget(scale_label)
 
             self._label_layout.addWidget(row_widget)

@@ -8,6 +8,7 @@ EEGView 内部子模块：通道元数据（颜色 / 区域 / 默认增益 / 标
 from typing import List
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from biostyle import TEXT
 
 
 # ============================================================================
@@ -60,13 +61,13 @@ _REGION_CHINESE: dict = {
 
 # (波形色, 标签 chip 色, 区域背景带颜色, 区域缩写)
 _REGION_PALETTE: dict = {
-    "frontal":   (QtGui.QColor(255, 138, 92),   QtGui.QColor(255, 138, 92),  QtGui.QColor(40, 26, 20),  "FRONT"),
-    "central":   (QtGui.QColor(91, 240, 214),   QtGui.QColor(91, 240, 214),  QtGui.QColor(18, 36, 35),  "CENT"),
-    "parietal":  (QtGui.QColor(122, 184, 255),  QtGui.QColor(122, 184, 255), QtGui.QColor(20, 30, 48),  "PARI"),
-    "occipital": (QtGui.QColor(166, 108, 255),  QtGui.QColor(166, 108, 255), QtGui.QColor(32, 22, 48),  "OCCI"),
-    "temporal":  (QtGui.QColor(255, 105, 180),  QtGui.QColor(255, 105, 180), QtGui.QColor(40, 22, 32),  "TEMP"),
-    "ref":       (QtGui.QColor(140, 151, 180),  QtGui.QColor(80, 90, 110),   QtGui.QColor(24, 28, 36),  "REF"),
-    "other":     (QtGui.QColor(200, 200, 200),  QtGui.QColor(200, 200, 200), QtGui.QColor(28, 28, 28),  "..."),
+    "frontal":   (QtGui.QColor('#A75028'), QtGui.QColor('#A75028'), QtGui.QColor('#FBF1EC'), "FRONT"),
+    "central":   (QtGui.QColor('#087E78'), QtGui.QColor('#087E78'), QtGui.QColor('#EDF7F5'), "CENT"),
+    "parietal":  (QtGui.QColor('#2569A2'), QtGui.QColor('#2569A2'), QtGui.QColor('#EDF4FA'), "PARI"),
+    "occipital": (QtGui.QColor('#7752A1'), QtGui.QColor('#7752A1'), QtGui.QColor('#F4F0F8'), "OCCI"),
+    "temporal":  (QtGui.QColor('#A34377'), QtGui.QColor('#A34377'), QtGui.QColor('#FAEFF5'), "TEMP"),
+    "ref":       (QtGui.QColor('#647789'), QtGui.QColor('#647789'), QtGui.QColor('#F0F3F6'), "REF"),
+    "other":     (QtGui.QColor('#566B7A'), QtGui.QColor('#566B7A'), QtGui.QColor('#F0F3F6'), "..."),
 }
 
 # 区域绘制顺序（标签列从上到下排列区域，方便视觉定位）
@@ -146,11 +147,11 @@ class ChannelItemDelegate(QtWidgets.QStyledItemDelegate):
                 chip_color,
             )
 
-            # 通道名（粗体 + 偏白）
-            text_color = QtGui.QColor("#FFFFFF" if option.state & QtWidgets.QStyle.State_Selected else "#E6ECF7")
+            # 浅色列表和选中底色上均使用深色通道名。
+            text_color = QtGui.QColor(TEXT)
             region_label = get_region_label(name)
             region_color = QtGui.QColor(_REGION_PALETTE[region_of(name)][1])
-            region_color.setAlpha(180 if not (option.state & QtWidgets.QStyle.State_Selected) else 240)
+            region_color.setAlpha(240)
 
             text_x = rect.x() + self.CHIP_WIDTH + 6
             text_w = rect.width() - self.CHIP_WIDTH - 8

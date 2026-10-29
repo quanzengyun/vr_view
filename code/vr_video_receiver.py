@@ -1,6 +1,7 @@
 """独立 TCP 视频接收器：VRVF + 小端 seq、JPEG 长度 + JPEG 数据。"""
 
 import io
+import select
 import socket
 import struct
 import threading
@@ -99,104 +100,112 @@ class VRVideoReceiver:
 
     # ---------- 网络 ----------
     def _accept_loop(self, server):
-        """单线程依次接受、接收和关闭连接；断开后继续等待头显。"""
+        """单线程监听连接及数据；重连时用新连接替换旧连接。"""
+        buf = b''
         try:
             while self.is_running:
-                try:
+                client = self._client_sock
+                readable, _, _ = select.select([server] + ([client] if client else []), [], [], 0.5)
+                if server in readable:
                     client, addr = server.accept()
+                    if not self.is_running:
+                        client.close()
+                        break
+                    # 旧TCP可能仍存活；新连接必须能立即接管，不等待旧连接recv退出。
+                    self._close_socket(self._client_sock)
+                    client.settimeout(0.5)
+                    self._client_sock = client
+                    buf = b''  # 半帧缓存属于旧连接，不能拼接到新连接。
+                    print(f"[VRVideo] VR 端已连接: {addr}")
+                client = self._client_sock
+                if client not in readable:
+                    continue
+                try:
+                    chunk = client.recv(65536)
                 except socket.timeout:
                     continue
-                with client:
-                    if not self.is_running:
-                        break
-                    self._client_sock = client
-                    print(f"[VRVideo] VR 端已连接: {addr}")
-                    try:
-                        self._recv_loop(client)
-                    except OSError as exc:
-                        if self.is_running:
-                            print(f"[VRVideo] 接收中断: {exc}")
-                    finally:
-                        self._client_sock = None
-        except OSError as exc:
+                except OSError as exc:
+                    if self.is_running:
+                        print(f"[VRVideo] 接收中断: {exc}")
+                    chunk = b''
+                if not chunk:
+                    self._close_socket(client)
+                    self._client_sock = None
+                    buf = b''
+                    if self.is_running:
+                        print("[VRVideo] VR 端断开，等待重连...")
+                    continue
+                buf = self._decode_frames(buf + chunk)
+        except (OSError, ValueError) as exc:
             if self.is_running:
-                print(f"[VRVideo] accept 异常: {exc}")
+                print(f"[VRVideo] 接收循环异常: {exc}")
         finally:
+            self._close_socket(self._client_sock)
+            self._client_sock = None
             server.close()
             self._server_sock = None
             self.is_running = False
 
-    def _recv_loop(self, sock):
-        buf = b''
-        sock.settimeout(0.5)
-        while self.is_running and self._client_sock is sock:
-            try:
-                chunk = sock.recv(65536)
-                if not chunk:
-                    print("[VRVideo] VR 端断开，等待重连...")
+    def _decode_frames(self, buf):
+        # 解析：只要能解析出完整帧就解析
+        while len(buf) >= HEADER_SIZE:
+            # 检查 magic
+            if buf[:4] != MAGIC:
+                # 找下一个 magic
+                idx = buf.find(MAGIC, 1)
+                if idx == -1:
+                    # magic 都不全，保留尾巴 3 字节
+                    buf = buf[-3:]
                     break
-                buf += chunk
-            except socket.timeout:
+                buf = buf[idx:]
+                continue
+            # 读 seq + len
+            # 注意：PICO.cs 用小端写入（C# 显式 byte-by-byte），所以这里也用小端解析
+            seq, length = struct.unpack('<II', buf[4:12])
+            # 防御：长度异常就跳一字节找下一个 magic
+            if length <= 0 or length > 5_000_000:
+                print(f"[VRVideo] 异常帧长度 {length}，跳过")
+                buf = buf[4:]
+                continue
+            need = HEADER_SIZE + length
+            if len(buf) < need:
+                break  # 等更多
+            jpg = buf[HEADER_SIZE:need]
+            buf = buf[need:]
+
+            # 解码
+            frame = self._decode(jpg)
+            if frame is None:
+                self.dropped_frames += 1
                 continue
 
-            # 解析：只要能解析出完整帧就解析
-            while len(buf) >= HEADER_SIZE:
-                # 检查 magic
-                if buf[:4] != MAGIC:
-                    # 找下一个 magic
-                    idx = buf.find(MAGIC, 1)
-                    if idx == -1:
-                        # magic 都不全，保留尾巴 3 字节
-                        buf = buf[-3:]
-                        break
-                    buf = buf[idx:]
-                    continue
-                # 读 seq + len
-                # 注意：PICO.cs 用小端写入（C# 显式 byte-by-byte），所以这里也用小端解析
-                seq, length = struct.unpack('<II', buf[4:12])
-                # 防御：长度异常就跳一字节找下一个 magic
-                if length <= 0 or length > 5_000_000:
-                    print(f"[VRVideo] 异常帧长度 {length}，跳过")
-                    buf = buf[4:]
-                    continue
-                need = HEADER_SIZE + length
-                if len(buf) < need:
-                    break  # 等更多
-                jpg = buf[HEADER_SIZE:need]
-                buf = buf[need:]
+            # 丢帧统计
+            if self.last_seq >= 0 and seq > self.last_seq + 1:
+                self.dropped_frames += (seq - self.last_seq - 1)
+            self.last_seq = seq
+            self.total_frames += 1
+            self.fps_counter += 1
+            now = time.time()
+            if now - self.fps_timer >= 1.0:
+                self.current_fps = self.fps_counter / (now - self.fps_timer)
+                self.fps_counter = 0
+                self.fps_timer = now
 
-                # 解码
-                frame = self._decode(jpg)
-                if frame is None:
-                    self.dropped_frames += 1
-                    continue
+            with self._lock:
+                self.latest_frame = frame
+                self.latest_seq = seq
 
-                # 丢帧统计
-                if self.last_seq >= 0 and seq > self.last_seq + 1:
-                    self.dropped_frames += (seq - self.last_seq - 1)
-                self.last_seq = seq
-                self.total_frames += 1
-                self.fps_counter += 1
-                now = time.time()
-                if now - self.fps_timer >= 1.0:
-                    self.current_fps = self.fps_counter / (now - self.fps_timer)
-                    self.fps_counter = 0
-                    self.fps_timer = now
-
-                with self._lock:
-                    self.latest_frame = frame
-                    self.latest_seq = seq
-
-                if self.on_frame:
-                    try:
-                        self.on_frame(frame, seq)
-                    except Exception:
-                        self.callback_errors += 1
-                        now = time.monotonic()
-                        if (self._last_callback_error_time is None
-                                or now - self._last_callback_error_time >= 5.0):
-                            self._last_callback_error_time = now
-                            log_exc(f"[VRVideo] 显示回调失败 seq={seq}（同类错误每5秒记录一次）:")
+            if self.on_frame:
+                try:
+                    self.on_frame(frame, seq)
+                except Exception:
+                    self.callback_errors += 1
+                    now = time.monotonic()
+                    if (self._last_callback_error_time is None
+                            or now - self._last_callback_error_time >= 5.0):
+                        self._last_callback_error_time = now
+                        log_exc(f"[VRVideo] 显示回调失败 seq={seq}（同类错误每5秒记录一次）:")
+        return buf
 
     # ---------- 解码 ----------
     def _decode(self, jpg: bytes) -> Optional[np.ndarray]:

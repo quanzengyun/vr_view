@@ -23,6 +23,9 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from biostyle import (apply_theme, PLOT as _BG_DEEP,
+                      PANEL as _BG_HEAD, BORDER as _BORDER, TEXT as _TEXT_MAIN,
+                      MUTED as _TEXT_DIM, BLUE as _SELECT, SUCCESS, ORANGE, ERROR)
 
 
 # ============================================================================
@@ -137,13 +140,6 @@ STANDARD_32_CHANNELS: List[str] = [
 # 颜色定义（与主窗口一致）
 # ============================================================================
 
-_BG_DEEP   = "#0B1020"
-_BG_PANEL  = "#141A2E"
-_BG_HEAD   = "#1C2440"
-_BORDER    = "#2A3553"
-_TEXT_MAIN = "#E6ECF7"
-_TEXT_DIM  = "#8C97B4"
-_SELECT    = "#4F7BFF"
 
 COLOR_DISCONNECT = QtGui.QColor(120, 130, 150)
 COLOR_GOOD       = QtGui.QColor(80, 220, 120)
@@ -314,22 +310,7 @@ class ImpedanceWidget(QtWidgets.QDialog):
     # ---------------------- UI 初始化 ----------------------
 
     def _init_ui(self) -> None:
-        self.setStyleSheet(
-            f"QWidget {{ background-color: {_BG_DEEP}; color: {_TEXT_MAIN}; }}"
-            f"QGroupBox {{ border: 1px solid {_BORDER}; border-radius: 6px;"
-            f" margin-top: 10px; padding-top: 14px; }}"
-            f"QGroupBox::title {{ subcontrol-origin: margin; left: 12px;"
-            f" padding: 0 6px; color: {_TEXT_DIM}; }}"
-            f"QPushButton {{ background-color: #1E2A4F; color: {_TEXT_MAIN};"
-            f" border: 1px solid {_BORDER}; padding: 6px 14px; border-radius: 4px; }}"
-            f"QPushButton:hover {{ background-color: #2A3B6E; }}"
-            f"QPushButton:disabled {{ color: #555; }}"
-            f"QPushButton:checked {{ background-color: {_SELECT}; }}"
-            f"QLabel {{ color: {_TEXT_MAIN}; }}"
-            f"QSlider::groove:horizontal {{ height: 4px; background: {_BORDER}; }}"
-            f"QSlider::handle:horizontal {{ width: 14px; height: 14px;"
-            f" background: {_SELECT}; margin: -6px 0; border-radius: 7px; }}"
-        )
+        apply_theme(self)
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(16, 12, 16, 12)
@@ -488,7 +469,7 @@ class ImpedanceWidget(QtWidgets.QDialog):
     def set_sdk_connected(self, connected: bool, channel_count: int = 0) -> None:
         if connected:
             self.label_sdk_state.setText(f"●  已连接 ({channel_count} 通道)")
-            self.label_sdk_state.setStyleSheet("color: #50DC78;")
+            self.label_sdk_state.setStyleSheet(f"color: {SUCCESS};")
         else:
             self.label_sdk_state.setText("●  未连接")
             self.label_sdk_state.setStyleSheet(f"color: {_TEXT_DIM};")
@@ -521,11 +502,11 @@ class ImpedanceWidget(QtWidgets.QDialog):
         self.label_max_imp.setText(f"最高阻抗: {max_name} {max_v:.1f} kΩ")
         self.label_total.setText(f"总通道: {len(self._impedance_values)}")
         if rate >= 90:
-            color = "#50DC78"
+            color = SUCCESS
         elif rate >= 70:
-            color = "#FFC846"
+            color = ORANGE
         else:
-            color = "#FF5060"
+            color = ERROR
         self.label_pass_rate.setStyleSheet(f"color: {color}; font-weight: bold;")
 
 

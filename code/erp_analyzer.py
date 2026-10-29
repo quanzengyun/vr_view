@@ -14,9 +14,9 @@ import threading
 @dataclass
 class EventMarker:
     """事件标记：target 或 standard 刺激"""
-    timestamp_ms: int  # 事件发生的时间戳（毫秒）
+    timestamp_ms: int  # 在线入口传入已定位样本的采样时间（ms），不是绘图刷新时刻。
     event_type: str     # 'target' 或 'standard'
-    channel: Optional[int] = None  # 可选：特定通道
+    channel: Optional[int] = None  # 刺激目标编号；不用于选择 EEG 导联。
 
 
 class ERPAnalyzer:
@@ -44,7 +44,8 @@ class ERPAnalyzer:
         self.post_stimulus_ms = post_stimulus_ms
         self.baseline_correction = baseline_correction
         
-        # 计算时间窗口（样本数）
+        # 时间窗按秒定义，采样率只决定点数：1000 Hz下为100+500=600点。
+        # 右端不包含，实际时间坐标为−100～499 ms；500 Hz下则为300点。
         self.pre_stimulus_samples = int(pre_stimulus_ms * sample_rate / 1000.0)
         self.post_stimulus_samples = int(post_stimulus_ms * sample_rate / 1000.0)
         self.epoch_length = self.pre_stimulus_samples + self.post_stimulus_samples
@@ -89,6 +90,8 @@ class ERPAnalyzer:
 
     def configure_analysis_groups(self, channel_names):
         """M1/M2不参与ERP；其余通道独立显示并共享全覆盖试次质量检查。"""
+        # 保留原采集列索引，避免排除M1/M2后将后续导联的数据与名称错配。
+        # 此处只限定ERP查看、质控和导出范围，预处理仍接收完整采集通道。
         included = [(i, name) for i, name in enumerate(channel_names)
                     if name.casefold() not in {'m1', 'm2'}]
         self.analysis_channel_names = [name for _, name in included]
@@ -184,7 +187,7 @@ class ERPAnalyzer:
         if not data_buffer:
             return "pending"
 
-        # 找到事件时间点附近的数据
+        # 在补偿了FIR延迟的采样时间轴上定位事件；buffer必须按采样时间排序。
         event_idx = bisect_left(data_buffer, event.timestamp_ms, key=lambda item: item[0])
         if event_idx == len(data_buffer):
             return "pending"
@@ -193,6 +196,7 @@ class ERPAnalyzer:
         if event_idx < self.pre_stimulus_samples:
             return "insufficient_pre_stimulus"
         if event_idx + self.post_stimulus_samples > len(data_buffer):
+            # 尚未收到完整后窗是“等待”，不能提前丢弃事件或补零制造试次。
             return "pending"
         
         # 提取 epoch
@@ -203,6 +207,7 @@ class ERPAnalyzer:
         if any(np.asarray(voltage).shape != (self.n_channels,) for _, voltage in segment):
             return "channel_count_mismatch"
         times = np.array([ts for ts, _ in segment], dtype=float)
+        # 跨过缺失样本的拼接不能视为连续600点，否则ERP时间位置会被压缩。
         if np.any(np.abs(np.diff(times) - 1000.0 / self.sample_rate) > 0.001):
             return "discontinuous_samples"
         epoch_data = np.stack([voltage for _, voltage in segment], axis=1).astype(float)
@@ -214,14 +219,15 @@ class ERPAnalyzer:
 
     def _store_epoch(self, event, epoch_data):
         
-        # 基线校正（使用 pre-stimulus 期间的平均值）
+        # 每个通道、每个试次各自减去刺激前均值；0 ms刺激样本不参与基线。
         if self.baseline_correction:
             baseline = np.mean(epoch_data[:, :self.pre_stimulus_samples], axis=1, keepdims=True)
             epoch_data = epoch_data - baseline
         if self.preprocessor is not None and self.analysis_error:
             return 'analysis_channels_unavailable'
         if self.preprocessor is not None and not self.preprocessor.config.empty_acquisition_debug:
-            # MATLAB的振幅与方差规则；此处数据已经是微伏，var使用N-1分母。
+            # MATLAB的振幅与方差规则：对全部30个ERP通道×时间点整体计算。
+            # 单位为µV/µV²，ddof=1对应MATLAB var默认的N−1分母。
             indices = self._quality_indices if self._quality_indices is not None else np.arange(self.n_channels)
             quality_data = epoch_data[indices]
             peak_channel = int(indices[np.argmax(np.max(np.abs(quality_data), axis=1))])
@@ -238,7 +244,8 @@ class ERPAnalyzer:
                 quality['status'] = 'variance_artifact'
                 return "variance_artifact"
         
-        # 添加到对应的列表
+        # 质控通过后才累计；所有通道共享同一套试次，切换查看通道不重新剔除。
+        # 保留各试次供导出，平均值用累计和更新，避免反复stack全部历史试次。
         if event.event_type.lower() == 'target':
             self.target_epochs.append(epoch_data)
             self.n_target_trials += 1
@@ -259,6 +266,7 @@ class ERPAnalyzer:
             return "unsupported_event_type"
 
         if self.target_erp is not None and self.standard_erp is not None:
+            # 差异波定义为Target−Standard，不代表单独检测出的P300成分。
             self.p300_erp = self.target_erp - self.standard_erp
         return "accepted"
     
@@ -292,6 +300,7 @@ class ERPAnalyzer:
         if self.analysis_error:
             result['preprocessing_status'] += '；' + self.analysis_error
         if group_idx is not None:
+            # 当前每个选项只含一个实际通道；保留indices接口兼容已有导出格式。
             group = self.analysis_groups[group_idx]
             result['analysis_group'] = group['label']
             if group['available']:
@@ -344,6 +353,7 @@ class ERPAnalyzer:
         if self.preprocessing_pending:
             raise RuntimeError("坏导插值初始化尚未就绪")
         shape = (0, self.n_channels, self.epoch_length)
+        # 内部试次按[通道, 时间]保存，导出堆叠为[试次, 通道, 时间]，单位µV。
         arrays = dict(time_ms=self.time_axis_ms,
                       experiment_mode=np.asarray('empty_acquisition_debug' if self.preprocessor is not None
                           and self.preprocessor.config.empty_acquisition_debug else 'experiment'),
@@ -360,6 +370,7 @@ class ERPAnalyzer:
                           channel_names=np.asarray(self.preprocessor.channel_names))
         if self.analysis_groups and not self.analysis_error:
             # ERP结果排除M1/M2；预处理通道和插值矩阵仍对应完整采集输入。
+            # channel_names对应30列ERP；preprocessing_channel_names对应32列输入。
             if self.preprocessor is not None:
                 arrays['preprocessing_channel_names'] = np.asarray(self.preprocessor.channel_names)
             arrays['channel_names'] = np.asarray(self.analysis_channel_names)

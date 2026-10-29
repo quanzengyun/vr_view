@@ -11,6 +11,7 @@ VR 视频显示组件（第一步：显示视频帧）
 import numpy as np
 from PyQt5 import QtCore, QtWidgets, QtGui
 from typing import Optional
+from biostyle import PLOT, MUTED
 
 
 class VRVideoWidget(QtWidgets.QWidget):
@@ -33,7 +34,7 @@ class VRVideoWidget(QtWidgets.QWidget):
         # 视频显示标签
         self.video_label = QtWidgets.QLabel(self)
         self.video_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.video_label.setStyleSheet("background-color: #2D3748; color: #C8D5E8; font-size: 13px;")
+        self.video_label.setStyleSheet(f"background-color: {PLOT}; color: {MUTED}; font-size: 13px;")
         self.video_label.setText("等待视频流...")
         layout.addWidget(self.video_label)
         

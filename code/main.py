@@ -12,6 +12,7 @@ from main_window import MainWindow
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    app.setStyle("Fusion")
     win = MainWindow() 
     win.show() 
     sys.exit(app.exec_())

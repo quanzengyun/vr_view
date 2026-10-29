@@ -25,7 +25,7 @@ from marker_session import encode_marker
 from vr_marker_receiver import VRMarkerReceiver
 from vr_video_widget import VRVideoWidget
 from gaze_trajectory_widget import GazeTrajectoryWidget
-from biostyle import MAIN_QSS, EEGBreathingController
+from biostyle import apply_theme, SUCCESS, ERROR
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -69,7 +69,7 @@ class MainWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget(self)
         central.setObjectName("central")
         self.setCentralWidget(central)
-        self.setStyleSheet(MAIN_QSS)
+        apply_theme(self)
 
         root_layout = QtWidgets.QHBoxLayout(central)
         root_layout.setContentsMargins(0, 0, 0, 0)
@@ -82,7 +82,6 @@ class MainWindow(QtWidgets.QMainWindow):
         root_layout.addWidget(self.mainContainer, 1)
 
         self._init_sidebar_animation()
-        self._init_breathing()
 
     def _create_sidebar(self):
         # 采集参数、实验控制和连接状态。
@@ -104,11 +103,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.toggleButton.setObjectName("toggleButton")
         self.toggleButton.setFixedSize(18, 48)
         self.toggleButton.setCursor(QtCore.Qt.PointingHandCursor)
-        self.toggleButton.setStyleSheet(
-            "QPushButton { background-color: #2C5CC5; color: white; border: none;"
-            " border-top-right-radius: 4px; border-bottom-right-radius: 4px; }"
-            "QPushButton:hover { background-color: #254EA6; }"
-        )
         self.toggleButton.clicked.connect(self._toggle_sidebar)
 
         # 把 toggleButton 和 sideBar 装入一个水平容器：按钮固定 18px 在最左
@@ -188,7 +182,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pushButton_import = self._button("导入数据", "secondary")
 
         # 阻抗检测：弹出独立窗口
-        self.pushButton_impedance = self._button("🧠  阻抗检测", "secondary")
+        self.pushButton_impedance = self._button("阻抗检测", "secondary")
         self.pushButton_impedance.setToolTip(
             "打开脑电帽阻抗检测窗口\n（用于检查电极与头皮接触质量）"
         )
@@ -355,7 +349,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._anim_group.addAnimation(self._anim_side_max)
 
     def _init_vr_receiver(self):
-        # ★ 启动时探测 PC 当前 IP，自动更新 vr_config.json（VR 端 PICO.cs 启动也会读这个文件）
+        # 更新电脑本地配置；头显运行时自动发现电脑尚未实现，见 README 待办。
         try:
             from vr_config import auto_discover_and_update
             self.vr_config = auto_discover_and_update()
@@ -400,21 +394,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_band_high = 30.0
         self.save_dir = r"E:\VR展示\Save"
 
-    def _init_breathing(self):
-        """根据 EEG 流速驱动侧栏 + 主按钮的'神经脉冲'呼吸动画。"""
-        self._breathing = EEGBreathingController(
-            eeg_view=self.eegView,
-            sidebar=self.sideBarWidget,
-            primary_btn=self.pushButton_start,
-            status_label=self.statusLabel,
-            parent=self,
-        )
-
     # ---- Helper methods ----
 
     def _group_box(self, title: str) -> QtWidgets.QGroupBox:
         group = QtWidgets.QGroupBox(title)
-        # 样式由 MAIN_QSS 统一管理（神经脉冲主题）
+        # 样式由 biostyle 统一管理。
         return group
 
     def _combo(self, items: list, default: str = None) -> QtWidgets.QComboBox:
@@ -426,11 +410,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return combo
 
     def _button(self, text: str, role: str = "secondary", checkable: bool = False) -> QtWidgets.QPushButton:
-        """
-        生物脉冲主题按钮工厂。
-        role: 'primary' 主操作 / 'warn' 警示 / 'secondary' 次级 /
-              'event_target' / 'event_standard' 事件标记 / None 走默认
-        """
+        """创建使用统一主题的操作按钮。"""
         btn = QtWidgets.QPushButton(text)
         btn.setCheckable(checkable)
         btn.setProperty("role", role if role else "")
@@ -459,6 +439,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---- Signal handlers ----
 
     def _erp_preprocessing_config(self):
+        # 开关只改变在线分析策略，不改变放大器输入和原始EDF/CSV保存内容。
         return ERPPreprocessingConfig(empty_acquisition_debug=self.check_empty_acquisition.isChecked())
 
     def _on_experiment_mode_changed(self, checked):
@@ -557,7 +538,8 @@ class MainWindow(QtWidgets.QMainWindow):
         def saved(path):
             if getattr(self, '_closing', False):
                 return
-            # 原始数据先保存，坏导初始化完成后再导出同一处理条件下的ERP结果。
+            # 原始数据先保存；后台坏导模型就绪后回放剩余连续数据，再导出ERP。
+            # 因此分析初始化较慢不阻塞原始数据落盘，导出也不会使用半完成的模型。
             if path and self.erp_analyzer.preprocessing_pending:
                 self.statusLabel.setText("状态: 原始数据已保存，等待坏导插值初始化完成...")
                 QtCore.QTimer.singleShot(200, lambda: saved(path))
@@ -611,7 +593,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_sdk_connected(self, channel_count: int, sample_rate: int):
         print(f"[SDK] 连接成功: {channel_count} 通道, {sample_rate} Hz")
-        self.eeg_status_indicator.setStyleSheet("font: bold 16px; color: #4caf50;")
+        self.eeg_status_indicator.setStyleSheet(f"font: bold 16px; color: {SUCCESS};")
         self.eeg_status_label.setText(f"已连接 ({channel_count}通道)")
         self.current_sampling_rate = sample_rate
         idx = self.combo_sampling.findText(str(sample_rate))
@@ -750,7 +732,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(str)
     def _on_error(self, message: str):
-        self.eeg_status_indicator.setStyleSheet("font: bold 16px; color: #f44336;")
+        self.eeg_status_indicator.setStyleSheet(f"font: bold 16px; color: {ERROR};")
         self.eeg_status_label.setText("连接错误")
         print(f"[EEG] 放大器连接错误: {message}")
         if hasattr(self, "eegView") and not self.eegView.recorder.enabled:
@@ -760,6 +742,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(object)
     def _on_marker_located(self, event):
+        # 软件事件由MarkerSession定位到样本后才入ERP队列；不用网络到达时刻直接切段。
         if event["event_type"] in {"target", "standard"}:
             self.erp_analyzer.add_event(EventMarker(event["sample_time_ms"],
                                                     event["event_type"], event["channel"]))
@@ -767,6 +750,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _process_erp(self, force=False):
         if not force and not self.pushButton_start.isChecked():
             return
+        # 独立采样游标避免重复消费；ERP读取录制会话，不依赖绘图是否跳帧。
         packets = self._data_worker.markers.packets_since(self._erp_next_index)
         if packets:
             self._erp_next_index = packets[-1].sample_index + 1
@@ -1028,10 +1012,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not recv:
             self.gaze_trajectory_widget.break_trace()
         if recv:
-            color = "#4caf50"        # 绿
+            color = SUCCESS
             text = "已连接"
         else:
-            color = "#d32f2f"        # 红
+            color = ERROR
             text = "未连接"
         if not hasattr(self, '_last_vr_status') or self._last_vr_status != (color, text):
             self._last_vr_status = (color, text)
@@ -1058,10 +1042,10 @@ class MainWindow(QtWidgets.QMainWindow):
             ch = (getattr(sdk, 'channel_count', None)
                   or getattr(sdk, '_channel_count', None)
                   or 32)
-            color = "#4caf50"
+            color = SUCCESS
             text = f"已连接 ({int(ch)}ch, {int(sr)}Hz)"
         else:
-            color = "#d32f2f"
+            color = ERROR
             text = ("模拟数据（非硬件）" if self.eegView.mock.enabled
                     else f"未连接 ({self.current_sampling_rate}Hz)")
 
@@ -1102,6 +1086,7 @@ class MainWindow(QtWidgets.QMainWindow):
 if __name__ == "__main__":
     import sys
     app = QtWidgets.QApplication(sys.argv)
+    app.setStyle("Fusion")
     win = MainWindow()
     win.show()
     sys.exit(app.exec_())

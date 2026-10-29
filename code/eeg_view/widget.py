@@ -6,6 +6,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
 from shared_buffer import SharedBuffer, DataPacket
+from biostyle import PLOT, BORDER, MUTED, style_plot
 
 try:
     from diag import debug as _dlog
@@ -108,19 +109,20 @@ class EEGViewWidget(QtWidgets.QWidget):
         right_v.setSpacing(0)
         main_layout.addLayout(right_v, 1)
 
-        self.plot = pg.PlotWidget(background="#161D33")
+        self.plot = pg.PlotWidget(background=PLOT)
+        style_plot(self.plot)
         self.plot.getPlotItem().setContentsMargins(0, 0, 0, 0)
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.setMouseEnabled(x=False, y=False)
         self.plot.setMenuEnabled(False)
         self.plot.setXRange(0, self.window_sec, padding=0)
         self.plot.setYRange(0, 1, padding=0)
-        self.plot.getPlotItem().getViewBox().setBackgroundColor("#161D33")
         right_v.addWidget(self.plot, 1)
 
         # marker 条：X 轴下方一窄条，Y 范围 [-0.6, 0.6]，X 与主图同步
         # 收到一个 marker 就画一个黄色方块 + label 数字
-        self.marker_bar = pg.PlotWidget(background="#0F1424")
+        self.marker_bar = pg.PlotWidget(background=PLOT)
+        style_plot(self.marker_bar)
         self.marker_bar.setMouseEnabled(x=False, y=False)
         self.marker_bar.setMenuEnabled(False)
         self.marker_bar.hideButtons()
@@ -134,7 +136,7 @@ class EEGViewWidget(QtWidgets.QWidget):
         self.marker_bar.getPlotItem().setContentsMargins(0, 0, 0, 0)
         # 顶部加一条细分隔线（视觉上把 marker 条与主图分开）
         sep = pg.InfiniteLine(pos=0.6, angle=0,
-                              pen=pg.mkPen(color="#2A3553", width=1))
+                              pen=pg.mkPen(color=BORDER, width=1))
         sep.setZValue(-5)
         self.marker_bar.addItem(sep)
         right_v.addWidget(self.marker_bar)
@@ -166,8 +168,7 @@ class EEGViewWidget(QtWidgets.QWidget):
 
     def _install_axis(self):
         ax = self.plot.getAxis("bottom")
-        ax.setLabel(text="时间", color="#8C97B4")
-        ax.setStyle(tickFont=QtGui.QFont("Consolas", 8))
+        ax.setLabel(text="时间", color=MUTED)
         # X 轴刻度在 _update_view 里动态设
 
     def _install_grid(self):
@@ -175,7 +176,7 @@ class EEGViewWidget(QtWidgets.QWidget):
         for i in range(1, self.channel_count):
             line = pg.InfiniteLine(
                 pos=i * self.offset_step, angle=0,
-                pen=pg.mkPen(color="#2A3553", width=1, style=QtCore.Qt.DashLine),
+                pen=pg.mkPen(color=BORDER, width=1, style=QtCore.Qt.DashLine),
             )
             line.setZValue(-5)
             self.plot.addItem(line)
@@ -256,7 +257,7 @@ class EEGViewWidget(QtWidgets.QWidget):
         sp.setZValue(20)
         self.marker_bar.addItem(sp)
         # 数字（label）放在方块正下方
-        txt = pg.TextItem(text=str(int(label)), color="#FFE680",
+        txt = pg.TextItem(text=str(int(label)), color="#805600",
                           anchor=(0.5, 1.0))
         txt.setPos(float(x), -0.15)
         txt.setZValue(21)
